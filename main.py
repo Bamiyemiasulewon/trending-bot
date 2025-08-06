@@ -57,31 +57,25 @@ class TokenTrendingBot:
             pass
 
     def _setup_handlers(self):
-        from telegram.ext import ConversationHandler
+        from telegram.ext import ConversationHandler, CallbackQueryHandler
         TICKER, TOKEN_ADDRESS, CHAIN, PLATFORMS, ENGAGEMENT = range(5)
         PLATFORM_SELECT, CMC_EMAIL, CMC_PASSWORD, DEX_EMAIL, DEX_PASSWORD, DEXT_EMAIL, DEXT_PASSWORD, TWITTER_USER, TWITTER_PASSWORD, TWITTER_2FA, CONFIRM_ANOTHER = range(5, 16)
+
+        # Add basic command handlers
         self.app.add_handler(CommandHandler('start', self.start))
         self.app.add_handler(CommandHandler('menu', self.menu))
         self.app.add_handler(CommandHandler('trend', self.trend))
         self.app.add_handler(CommandHandler('check_payment', self.check_payment))
         self.app.add_handler(CommandHandler('payment_history', self.payment_history))
         self.app.add_handler(CommandHandler('status', self.status))
-        self.app.add_handler(CommandHandler('login', self.login))
-        self.app.add_handler(CommandHandler('stop', self.stop))
-        self.app.add_handler(CommandHandler('logout', self.logout))
-        self.app.add_handler(CommandHandler('reconnect', self.reconnect))
         self.app.add_handler(CommandHandler('help', self.help))
-        from telegram.ext import CallbackQueryHandler
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
-        conv_handler = ConversationHandler(
-            entry_points=[CommandHandler('start_trend', self.start_trend), CommandHandler('login', self.login), CommandHandler('logout', self.logout), CommandHandler('reconnect', self.reconnect)],
+
+        # Create conversation handler for platform login flow
+        login_handler = ConversationHandler(
+            entry_points=[CommandHandler('login', self.login)],
             states={
-                TICKER: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_ticker)],
-                TOKEN_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_token_address)],
-                CHAIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_chain)],
-                PLATFORMS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_platforms)],
-                ENGAGEMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_engagement)],
-                PLATFORM_SELECT: [CallbackQueryHandler(self.platform_select), MessageHandler(filters.TEXT & ~filters.COMMAND, self.platform_select)],
+                PLATFORM_SELECT: [CallbackQueryHandler(self.platform_select, pattern='^platform_(cmc|dexscreener|dextools|twitter)$')],
                 CMC_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.cmc_email)],
                 CMC_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.cmc_password)],
                 DEX_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.dex_email)],
@@ -91,37 +85,46 @@ class TokenTrendingBot:
                 TWITTER_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.twitter_user)],
                 TWITTER_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.twitter_password)],
                 TWITTER_2FA: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.twitter_2fa)],
-                CONFIRM_ANOTHER: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.confirm_another)],
                 'LOGOUT_SELECT': [MessageHandler(filters.TEXT & ~filters.COMMAND, self.logout_select)],
                 'RECONNECT_SELECT': [MessageHandler(filters.TEXT & ~filters.COMMAND, self.reconnect_select)],
             },
-            fallbacks=[]
+            fallbacks=[CommandHandler('cancel', self.cancel)],
+            per_message=False,  # Track conversation per user and chat, not per message
+            per_chat=True,      # Track conversation per chat
+            per_user=True      # Track conversation per user
         )
-        self.app.add_handler(conv_handler)
+        self.app.add_handler(login_handler)  # Fixed variable name from conv_handler to login_handler
 
     async def login(self, update, context):
         user_id = update.effective_user.id
         context.user_data['connections'] = self.load_connections(user_id)
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
         keyboard = [
-            [InlineKeyboardButton("CMC", callback_data='cmc')],
-            [InlineKeyboardButton("DEXScreener", callback_data='dexscreener')],
-            [InlineKeyboardButton("DEXTools", callback_data='dextools')],
-            [InlineKeyboardButton("Twitter", callback_data='twitter')]
+            [InlineKeyboardButton("CMC", callback_data='platform_cmc')],
+            [InlineKeyboardButton("DEXScreener", callback_data='platform_dexscreener')],
+            [InlineKeyboardButton("DEXTools", callback_data='platform_dextools')],
+            [InlineKeyboardButton("Twitter", callback_data='platform_twitter')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text("🔐 Choose Platform to Connect", reply_markup=reply_markup)
         return 5  # PLATFORM_SELECT
 
     async def platform_select(self, update, context):
-        # Handle both text and callback query
-        if hasattr(update, 'callback_query') and update.callback_query:
-            platform = update.callback_query.data.strip().lower()
-            await update.callback_query.answer(text=f"Selected {platform.capitalize()}")
-            msg_target = update.callback_query.message
-        else:
-            platform = update.message.text.strip().lower()
-            msg_target = update.message
+        # Will only handle callback queries due to pattern matching in handler
+        await update.callback_query.answer()
+        
+        platform = update.callback_query.data.replace('platform_', '')
+        msg_target = update.callback_query.message
+        
+        try:
+            await msg_target.edit_text(f"Selected: {platform.upper()}")
+        except Exception:
+            pass
+        
+        # Save selected platform for state tracking
+        context.user_data['selected_platform'] = platform
+        
+        # Send credential prompt based on platform
         if platform == 'cmc':
             await msg_target.reply_text("📧 Enter your CoinMarketCap email:")
             return 6  # CMC_EMAIL
@@ -134,9 +137,6 @@ class TokenTrendingBot:
         elif platform == 'twitter':
             await msg_target.reply_text("📱 Enter your Twitter username/email:")
             return 12  # TWITTER_USER
-        else:
-            await msg_target.reply_text("❌ Invalid platform. Please choose again.")
-            return 5
 
     async def cmc_email(self, update, context):
         context.user_data.setdefault('credentials', {}).setdefault('cmc', {})['email'] = update.message.text.strip()
@@ -462,9 +462,55 @@ class TokenTrendingBot:
     async def handle_message(self, update, context):
         await update.message.reply_text('Unknown command. Use /trend to start a campaign.')
 
+    async def cancel(self, update, context):
+        """Cancel the current conversation."""
+        from telegram.ext import ConversationHandler
+        await update.message.reply_text('Current operation cancelled. Use /help to see available commands.')
+        return ConversationHandler.END
+
+    async def error_handler(self, update, context):
+        """Log Errors caused by Updates."""
+        import logging
+        logging.error(f"Update {update} caused error {context.error}")
+        
+        # Try to determine if we can send a message back to the user
+        if update and update.effective_chat:
+            try:
+                if isinstance(context.error, telegram.error.NetworkError):
+                    await context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text="Network error occurred. Please check your internet connection."
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text="An error occurred. Please try again later."
+                    )
+            except Exception as e:
+                logging.error(f"Failed to send error message: {e}")
+        else:
+            logging.error("Could not determine chat to send error message to")
+
     def run(self):
-        self.app.run_polling()
+        # Add error handler
+        self.app.add_error_handler(self.error_handler)
+        
+        # Set up logging
+        import logging
+        logging.basicConfig(
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            level=logging.INFO
+        )
+        
+        print("Bot started successfully. Listening for commands...")
+        try:
+            self.app.run_polling(allowed_updates=telegram.Update.ALL_TYPES)
+        except telegram.error.NetworkError as e:
+            print(f"Network Error: {e}. Please check your internet connection.")
+        except Exception as e:
+            print(f"Error: {e}")
 
 if __name__ == '__main__':
+    import telegram
     bot = TokenTrendingBot()
     bot.run()
