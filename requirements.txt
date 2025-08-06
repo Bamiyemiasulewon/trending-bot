@@ -1,0 +1,10 @@
+python-telegram-bot
+web3
+solana
+selenium
+requests
+apscheduler
+psycopg2-binary
+python-dotenv
+tweepy
+flask
