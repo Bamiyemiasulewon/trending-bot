@@ -9,6 +9,7 @@ from decimal import Decimal
 from datetime import datetime
 from typing import Dict, List, Optional
 import random
+import traceback
 
 class CentralWalletManager:
     def __init__(self, is_testnet: bool = False):
@@ -164,7 +165,6 @@ class CentralWalletManager:
                 return 'result' in result and result['result']
                 
             return False
-            
         except Exception as e:
             self.logger.error(f"Error sending funds to {to_address}: {str(e)}")
             return False

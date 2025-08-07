@@ -17,6 +17,9 @@ class TokenTrendingBot:
     import json
     PERSIST_FILE = 'connections.json'
     def __init__(self):
+        ...
+        self.create_wallet_state = {}
+
         persistence = PicklePersistence(filepath='bot_data.pkl')
         self.app = ApplicationBuilder().token(TELEGRAM_TOKEN).persistence(persistence).build()
         self.scheduler = Scheduler()
@@ -50,32 +53,57 @@ class TokenTrendingBot:
             }
 
     def save_connections(self, user_id, connections):
+        pass
+
+    def load_bsc_wallets(self):
+        import json, os
+        path = os.path.join(os.path.dirname(__file__), 'bsc_wallets.json')
+        if not os.path.exists(path):
+            return []
         try:
-            data = {}
-            try:
-                with open(self.PERSIST_FILE, 'r') as f:
-                    data = json.load(f)
-            except Exception:
-                pass
-            data[str(user_id)] = connections
+            with open(path, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Error loading bsc_wallets.json: {e}")
+            raise
+
+    def save_bsc_wallets(self, wallets):
+        import json, os
+        path = os.path.join(os.path.dirname(__file__), 'bsc_wallets.json')
+        try:
+            with open(path, 'w') as f:
+                json.dump(wallets, f)
+        except Exception as e:
+            print(f"Error saving bsc_wallets.json: {e}")
+            raise
             with open(self.PERSIST_FILE, 'w') as f:
                 json.dump(data, f)
         except Exception:
             pass
 
     def _setup_handlers(self):
-        from telegram.ext import MessageHandler, filters
+        # Conversation handler for the trending setup
+        trend_conv_handler = ConversationHandler(
+            entry_points=[CommandHandler('start_trend', self.start_trend)],
+            states={
+                1: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_token_details)],
+            },
+            fallbacks=[CommandHandler('cancel', self.cancel_trend)],
+            per_message=False
+        )
+
         self.app.add_handler(CommandHandler('start', self.start))
-        self.app.add_handler(CommandHandler('start_trend', self.start_trend))
+        self.app.add_handler(CommandHandler('create_wallet', self.create_wallet))
+        self.app.add_handler(CommandHandler('cancel_wallet', self.cancel_wallet))
         self.app.add_handler(CommandHandler('status', self.status))
         self.app.add_handler(CommandHandler('menu', self.menu))
         self.app.add_handler(CommandHandler('trend', self.trend))
         self.app.add_handler(CommandHandler('check_payment', self.check_payment))
         self.app.add_handler(CommandHandler('payment_history', self.payment_history))
-        self.app.add_handler(CommandHandler('create_wallet', self.create_wallet))
         self.app.add_handler(CommandHandler('fund_wallet', self.fund_wallet))
         self.app.add_handler(CommandHandler('wallet_status', self.wallet_status))
         self.app.add_handler(CommandHandler('help', self.help))
+        self.app.add_handler(trend_conv_handler)
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_token_details))
 
     async def login(self, update, context):
@@ -308,6 +336,248 @@ class TokenTrendingBot:
         else:
             await update.message.reply_text("All connections complete! Use /status to check connections.")
             return ConversationHandler.END
+    def _split_message(self, msg, max_length=4000):
+        """Helper to split long messages for Telegram."""
+        lines = msg.split(', ')
+        chunks = []
+        current_chunk = ""
+        for line in lines:
+            if len(current_chunk) + len(line) + 2 > max_length:
+                chunks.append(current_chunk)
+                current_chunk = ""
+            current_chunk += (", " if current_chunk else "") + line
+        if current_chunk:
+            chunks.append(current_chunk)
+        return chunks
+
+    async def cancel_trend(self, update, context):
+        """Cancels and ends the trending conversation."""
+        await update.message.reply_text('Trending process has been canceled.')
+        return ConversationHandler.END
+
+    async def cancel_wallet(self, update, context):
+        """
+        Handles /cancel_wallet command: resets the wallet creation state.
+        """
+        await update.message.reply_text('Wallet creation process cancellation acknowledged.')
+        return
+
+    async def create_wallet(self, update, context):
+        """
+        Handles /create_wallet command: generates or retrieves persistent BSC wallets and displays them.
+        """
+        await update.message.reply_text('🔄 Creating BNB chain wallets... This may take a moment.')
+        try:
+            import time
+            from eth_account import Account
+            import random
+
+            # This will force a detailed error if eth_account is not installed.
+            Account.enable_unaudited_hdwallet_features()
+
+            wallets = self.load_bsc_wallets()
+            if len(wallets) >= 30:
+                msg = f'✅ Retrieved {len(wallets)} existing wallets: '
+                msg += ', '.join([
+                    f"{w['address']} (Private Key: {w['private_key']})" for w in wallets[:35]
+                ])
+                for chunk in self._split_message(msg):
+                    await update.message.reply_text(chunk)
+                return
+
+            # Generate new wallets if not enough exist
+            wallet_count = random.randint(30, 35)
+            new_wallets = []
+            start_time = time.time()
+            for i in range(wallet_count):
+                acct = Account.create()
+                new_wallets.append({'address': acct.address, 'private_key': acct.key.hex()})
+            end_time = time.time()
+            self.save_bsc_wallets(new_wallets)
+
+            msg = f'✅ Created {len(new_wallets)} new wallets in {end_time - start_time:.2f} seconds: \n'
+            msg += ', '.join([
+                f"{w['address']} (Private Key: {w['private_key']})" for w in new_wallets
+            ])
+
+            for chunk in self._split_message(msg):
+                await update.message.reply_text(chunk)
+            return
+
+        except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
+            # Construct a very specific error message
+            error_message = f"❌ A critical error occurred in create_wallet. Please check the console logs."
+            debug_message = f"**Error Details:**\nType: {type(e).__name__}\nMessage: {str(e)}\n\n**Traceback:**\n```{error_details}```"
+            
+            print("--- START OF /create_wallet ERROR ---")
+            print(error_details)
+            print("--- END OF /create_wallet ERROR ---")
+            
+            await update.message.reply_text(error_message)
+            # Send the detailed debug message, split if necessary
+            for chunk in self._split_message(debug_message, max_length=4096):
+                await update.message.reply_text(chunk)
+            return
+
+    async def cancel_wallet(self, update, context):
+        """
+        Cancels any in-progress wallet creation for the user and resets state.
+        """
+        user_id = update.effective_user.id
+        if self.create_wallet_state.get(user_id, {}).get('in_progress', False):
+            self.create_wallet_state[user_id]['in_progress'] = False
+            self.create_wallet_state[user_id]['wallets'] = []
+            self.create_wallet_state[user_id]['errors'] = []
+            self.create_wallet_state[user_id]['success'] = 0
+            context.user_data.pop('wallet_process', None)
+            await update.message.reply_text("Wallet creation process cancelled and state reset.")
+        else:
+            await update.message.reply_text("No wallet creation process is currently running.")
+        return
+
+    async def process_wallet_input(self, update, context):
+        user_id = update.effective_user.id
+        if 'wallet_process' not in context.user_data:
+            await update.message.reply_text("Please start with /create_wallet.")
+            return
+        step = context.user_data['wallet_process'].get('step')
+        text = update.message.text.strip()
+        if step == 'await_token_address':
+            context.user_data['wallet_process']['token_address'] = text
+            await update.message.reply_text("Please enter BNB amount per wallet (e.g., 0.01-0.05):")
+            context.user_data['wallet_process']['step'] = 'await_bnb_amount'
+            return
+        elif step == 'await_bnb_amount':
+            try:
+                min_amt, max_amt = [float(x) for x in text.replace(' ', '').split('-')]
+                if not (0 < min_amt <= max_amt <= 0.5):
+                    raise ValueError
+            except Exception:
+                await update.message.reply_text("Invalid BNB amount range. Please enter as 0.01-0.05:")
+                return
+            context.user_data['wallet_process']['min_bnb'] = min_amt
+            context.user_data['wallet_process']['max_bnb'] = max_amt
+            await update.message.reply_text("Generating wallets and preparing transactions...")
+            await self._run_wallet_creation(update, context)
+            return
+        else:
+            await update.message.reply_text("Unknown step. Please restart with /create_wallet.")
+            return
+
+    async def _run_wallet_creation(self, update, context):
+        import random, asyncio
+        from web3 import Web3
+        from eth_account import Account
+        user_id = update.effective_user.id
+        wallet_count = random.randint(30, 35)
+        min_bnb = context.user_data['wallet_process']['min_bnb']
+        max_bnb = context.user_data['wallet_process']['max_bnb']
+        token_address = context.user_data['wallet_process']['token_address']
+        bsc_rpc = os.getenv('BSC_MAINNET_RPC')
+        master_wallet_addr = os.getenv('BSC_CENTRAL_WALLET')
+        master_wallet_key = os.getenv('BSC_CENTRAL_WALLET_KEY')
+        w3 = Web3(Web3.HTTPProvider(bsc_rpc))
+        # 1. Generate wallets
+        wallets = []
+        for _ in range(wallet_count):
+            acct = Account.create()
+            wallets.append({'address': acct.address, 'private_key': acct.key.hex()})
+        self.create_wallet_state[user_id]['wallets'] = wallets
+        # 2. Display addresses
+        addr_list = ', '.join([w['address'] for w in wallets])
+        await update.message.reply_text(f"Created wallets: {addr_list}")
+        # 3. Fund wallets
+        total_bnb_needed = wallet_count * max_bnb * 1.1  # Add 10% buffer
+        master_balance = w3.eth.get_balance(master_wallet_addr) / 1e18
+        if master_balance < total_bnb_needed:
+            await update.message.reply_text(f"Master wallet has insufficient BNB ({master_balance:.2f}). Need at least {total_bnb_needed:.2f} BNB.")
+            self.create_wallet_state[user_id]['in_progress'] = False
+            return
+        # 4. Transfer BNB to wallets
+        nonce = w3.eth.get_transaction_count(master_wallet_addr)
+        gas_price = w3.eth.gas_price
+        txs = []
+        for i, w in enumerate(wallets):
+            amt = random.uniform(min_bnb, max_bnb)
+            tx = {
+                'to': w['address'],
+                'value': int(amt * 1e18),
+                'gas': 21000,
+                'gasPrice': gas_price,
+                'nonce': nonce + i,
+                'chainId': 56
+            }
+            signed = w3.eth.account.sign_transaction(tx, master_wallet_key)
+            try:
+                tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
+                txs.append((w['address'], amt, tx_hash.hex()))
+            except Exception as e:
+                self.create_wallet_state[user_id]['errors'].append((w['address'], str(e)))
+        await update.message.reply_text("Funding wallets, waiting for confirmations...")
+        await asyncio.sleep(15)
+        # 5. For each wallet, buy/sell token
+        router_addr = Web3.to_checksum_address(os.getenv('PANCAKESWAP_ROUTER', '0x10ED43C718714eb63d5aA57B78B54704E256024E'))
+        abi = ... # Load PancakeSwap router ABI here
+        router = w3.eth.contract(address=router_addr, abi=abi)
+        success_count = 0
+        for w in wallets:
+            try:
+                # Buy token
+                bnb_amt = random.uniform(min_bnb, max_bnb)
+                acct = Account.from_key(w['private_key'])
+                nonce = w3.eth.get_transaction_count(w['address'])
+                # Build buy tx (swapExactETHForTokens)
+                buy_tx = router.functions.swapExactETHForTokens(
+                    0,  # amountOutMin
+                    [w3.to_checksum_address(w3.to_checksum_address('0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE')), w3.to_checksum_address(token_address)],
+                    w['address'],
+                    int(time.time()) + 600
+                ).build_transaction({
+                    'from': w['address'],
+                    'value': int(bnb_amt * 1e18),
+                    'gas': 300000,
+                    'gasPrice': w3.eth.gas_price,
+                    'nonce': nonce,
+                    'chainId': 56
+                })
+                signed_buy = w3.eth.account.sign_transaction(buy_tx, w['private_key'])
+                buy_hash = w3.eth.send_raw_transaction(signed_buy.rawTransaction)
+                # Wait for buy confirmation
+                w3.eth.wait_for_transaction_receipt(buy_hash, timeout=120)
+                # Sell token (swapExactTokensForETH)
+                # Approve router
+                # ... (add approval logic)
+                # Build sell tx
+                sell_tx = router.functions.swapExactTokensForETH(
+                    0,  # amountIn
+                    0,  # amountOutMin
+                    [w3.to_checksum_address(token_address), w3.to_checksum_address('0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE')],
+                    w['address'],
+                    int(time.time()) + 600
+                ).build_transaction({
+                    'from': w['address'],
+                    'gas': 300000,
+                    'gasPrice': w3.eth.gas_price,
+                    'nonce': nonce + 1,
+                    'chainId': 56
+                })
+                signed_sell = w3.eth.account.sign_transaction(sell_tx, w['private_key'])
+                sell_hash = w3.eth.send_raw_transaction(signed_sell.rawTransaction)
+                w3.eth.wait_for_transaction_receipt(sell_hash, timeout=120)
+                success_count += 1
+                await asyncio.sleep(random.randint(10, 15))
+            except Exception as e:
+                self.create_wallet_state[user_id]['errors'].append((w['address'], str(e)))
+                continue
+        self.create_wallet_state[user_id]['in_progress'] = False
+        # 6. Report summary
+        if self.create_wallet_state[user_id]['errors']:
+            await update.message.reply_text("Some transactions failed due to errors. Process completed for successful wallets.")
+        await update.message.reply_text(f"Created and processed {wallet_count} wallets. Buy/sell transactions completed for {success_count} wallets on DexScreener-tracked DEX. Check DexScreener for activity.")
+        return
+
     async def menu(self, update, context):
         commands = [
             '/start - Welcome message',
@@ -330,23 +600,176 @@ class TokenTrendingBot:
         await update.message.reply_text('Use /start_trend <token_address> <chain> <platforms> <engagement> to begin a campaign.')
 
     async def start_trend(self, update, context):
-        """Collect all token details in one message."""
+        """
+        Integrated trending workflow: uses persistent wallets, funds, and automates buy/sell.
+        """
+        import os, random, asyncio
+        from web3 import Web3
+        from eth_account import Account
+        from decimal import Decimal
+        user_id = update.effective_user.id
+        # Prevent overlapping runs
+        if getattr(self, 'trend_in_progress', False):
+            await update.message.reply_text("A trending process is already running. Please wait for it to finish or use /cancel_wallet to abort.")
+            return
+        self.trend_in_progress = True
+        # 1. Load wallets
+        wallets = self.load_bsc_wallets()
+        if len(wallets) < 30:
+            await update.message.reply_text("No wallets found. Please run /create_wallet first.")
+            self.trend_in_progress = False
+            return
+        # 2. Central wallet balance check
+        bsc_rpc = os.getenv('BSC_MAINNET_RPC')
+        master_wallet_addr = os.getenv('BSC_CENTRAL_WALLET')
+        master_wallet_key = os.getenv('BSC_CENTRAL_WALLET_KEY')
+        w3 = Web3(Web3.HTTPProvider(bsc_rpc))
+        min_bnb_needed = Decimal('0.0005') * Decimal(len(wallets))
+        min_usd = Decimal('13')
+        # Get BNB price in USD (simple method: use PancakeSwap or Coingecko API)
         try:
-            await update.message.reply_text(
-                "Please provide your token details in this format:\n[Token Address] [Chain] [Ticker]\n\n"
-                "Example: 0x1234...abcd ETH MYTOKEN\n\nSupported chains: ETH, BNB, SOL (or full forms: Ethereum, BNB Chain, Solana)\nNote: You can use any amount of spaces between the fields."
-            )
-            context.user_data['trend_step'] = 'collect_all'
+            import requests
+            price = requests.get('https://api.coingecko.com/api/v3/simple/price?ids=binancecoin&vs_currencies=usd', timeout=10).json()['binancecoin']['usd']
         except Exception:
-            await update.message.reply_text('An error occurred. Please try again later.')
-            context.user_data.pop('trend_step', None)
-            return ConversationHandler.END
+            price = 600  # fallback, update as needed
+        master_balance = Decimal(w3.eth.get_balance(master_wallet_addr)) / Decimal(1e18)
+        if master_balance * Decimal(price) < min_usd:
+            await update.message.reply_text(f"Central wallet has insufficient BNB (${master_balance * Decimal(price):.2f}). Need at least ${min_usd}.")
+            self.trend_in_progress = False
+            return
+        # 3. Fund wallets
+        await update.message.reply_text(f"Funding {len(wallets)} wallets with 0.0005 BNB each...")
+        nonce = w3.eth.get_transaction_count(master_wallet_addr)
+        gas_price = w3.eth.gas_price
+        for i, w in enumerate(wallets):
+            tx = {
+                'to': w['address'],
+                'value': int(Decimal('0.0005') * Decimal(1e18)),
+                'gas': 21000,
+                'gasPrice': gas_price,
+                'nonce': nonce + i,
+                'chainId': 56
+            }
+            signed = w3.eth.account.sign_transaction(tx, master_wallet_key)
+            try:
+                tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
+                await update.message.reply_text(f"Funded {w['address']} (tx: {tx_hash.hex()})")
+            except Exception as e:
+                await update.message.reply_text(f"Failed to fund {w['address']}: {e}")
+        await asyncio.sleep(15)
+        # 4. Prompt for token address
+        await update.message.reply_text("Please enter the token contract address to trend:")
+        context.user_data['trend_step'] = 'await_token_address_trend'
 
-        campaign_id = f"TREND_{int(time.time())}"
-        context.user_data['campaign_id'] = campaign_id
-        # Check user's connection status
-        connections = context.user_data.get('connections', self.load_connections(user_id))
-        connected_platforms = [p for p, v in connections.items() if v]
+        # Wait for token address and then run buy/sell automation
+        def check_token_address(update, context):
+            return context.user_data.get('trend_step') == 'await_token_address_trend' and update.message.text.startswith('0x')
+
+        async def handle_token_address(update, context):
+            token_address = update.message.text.strip()
+            await update.message.reply_text(f"Starting buy/sell automation for token: {token_address}\nTrending on DexScreener via PancakeSwap...")
+            router_addr = Web3.to_checksum_address(os.getenv('PANCAKESWAP_ROUTER', '0x10ED43C718714eb63d5aA57B78B54704E256024E'))
+            import json, os
+            abi_path = os.path.join(os.path.dirname(__file__), 'pancakeswap_router_abi.json')
+            if not os.path.exists(abi_path):
+                await update.message.reply_text("PancakeSwap router ABI file (pancakeswap_router_abi.json) not found in trending_bot directory. Aborting.")
+                self.trend_in_progress = False
+                return
+            with open(abi_path) as f:
+                router_abi = json.load(f)
+            router = w3.eth.contract(address=router_addr, abi=router_abi)
+            wbnb_addr = w3.to_checksum_address('0xBB4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c')
+            success_count = 0
+            errors = []
+            for i, w in enumerate(wallets):
+                try:
+                    acct = Account.from_key(w['private_key'])
+                    nonce = w3.eth.get_transaction_count(w['address'])
+                    bnb_balance = Decimal(w3.eth.get_balance(w['address'])) / Decimal(1e18)
+                    # Leave at least 0.00015 BNB for gas, use up to 0.00033 BNB to buy
+                    buy_amount_bnb = min(Decimal('0.00033'), bnb_balance - Decimal('0.00015'))
+                    if buy_amount_bnb <= 0:
+                        errors.append((w['address'], 'Insufficient BNB for buy+gas'))
+                        await update.message.reply_text(f"Wallet {w['address']} error: Not enough BNB for buy+gas.")
+                        continue
+                    # Buy: swapExactETHForTokens
+                    buy_tx = router.functions.swapExactETHForTokens(
+                        0,  # amountOutMin
+                        [wbnb_addr, w3.to_checksum_address(token_address)],
+                        w['address'],
+                        int(time.time()) + 600
+                    ).build_transaction({
+                        'from': w['address'],
+                        'value': int(buy_amount_bnb * Decimal(1e18)),
+                        'gas': 300000,
+                        'gasPrice': w3.eth.gas_price,
+                        'nonce': nonce,
+                        'chainId': 56
+                    })
+                    signed_buy = w3.eth.account.sign_transaction(buy_tx, w['private_key'])
+                    buy_hash = w3.eth.send_raw_transaction(signed_buy.rawTransaction)
+                    w3.eth.wait_for_transaction_receipt(buy_hash, timeout=120)
+                    # Approve router to spend tokens (ERC20 approve)
+                    # Check ERC20 compliance: approve and balanceOf must exist
+                    token_abi = [
+                        {"constant":False,"inputs":[{"name":"_spender","type":"address"},{"name":"_value","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"type":"function"},
+                        {"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"}
+                    ]
+                    token_contract = w3.eth.contract(address=w3.to_checksum_address(token_address), abi=token_abi)
+                    if not hasattr(token_contract.functions, 'approve') or not hasattr(token_contract.functions, 'balanceOf'):
+                        errors.append((w['address'], 'Token contract missing approve/balanceOf'))
+                        await update.message.reply_text(f"Token contract at {token_address} missing approve/balanceOf. Aborting for this wallet.")
+                        continue
+                    approve_tx = token_contract.functions.approve(router_addr, int(2**256-1)).build_transaction({
+                        'from': w['address'],
+                        'gas': 60000,
+                        'gasPrice': w3.eth.gas_price,
+                        'nonce': nonce+1,
+                        'chainId': 56
+                    })
+                    signed_approve = w3.eth.account.sign_transaction(approve_tx, w['private_key'])
+                    approve_hash = w3.eth.send_raw_transaction(signed_approve.rawTransaction)
+                    w3.eth.wait_for_transaction_receipt(approve_hash, timeout=120)
+                    # Sell: swapExactTokensForETH
+                    token_balance = token_contract.functions.balanceOf(w['address']).call()
+                    if token_balance == 0:
+                        errors.append((w['address'], 'No tokens to sell'))
+                        await update.message.reply_text(f"Wallet {w['address']} error: No tokens to sell after buy.")
+                        continue
+                    sell_tx = router.functions.swapExactTokensForETH(
+                        token_balance,
+                        0,
+                        [w3.to_checksum_address(token_address), wbnb_addr],
+                        w['address'],
+                        int(time.time()) + 600
+                    ).build_transaction({
+                        'from': w['address'],
+                        'gas': 300000,
+                        'gasPrice': w3.eth.gas_price,
+                        'nonce': nonce+2,
+                        'chainId': 56
+                    })
+                    signed_sell = w3.eth.account.sign_transaction(sell_tx, w['private_key'])
+                    sell_hash = w3.eth.send_raw_transaction(signed_sell.rawTransaction)
+                    w3.eth.wait_for_transaction_receipt(sell_hash, timeout=120)
+                    success_count += 1
+                    await update.message.reply_text(f"Wallet {w['address']} buy/sell complete.")
+                    await asyncio.sleep(random.randint(10, 15))
+                except Exception as e:
+                    errors.append((w['address'], str(e)))
+                    await update.message.reply_text(f"Wallet {w['address']} error: {e}")
+                    continue
+            if errors:
+                await update.message.reply_text(f"Some transactions failed due to errors. Process completed for {success_count} successful wallets.")
+            await update.message.reply_text(f"Trending process completed. Buy/sell transactions executed for {success_count} wallets on DexScreener-tracked DEX. Check DexScreener for trending status.")
+            self.trend_in_progress = False
+            return
+
+        # Register a one-time handler for token address input
+        from telegram.ext import MessageHandler, filters
+        handler = MessageHandler(filters.TEXT & ~filters.COMMAND, handle_token_address)
+        self.app.add_handler(handler, group=1)
+        return
         
         if not connected_platforms:
             await update.message.reply_text(
@@ -393,7 +816,7 @@ class TokenTrendingBot:
             context.user_data.pop('trend_step', None)
         except Exception as e:
             print(f"[DEBUG] Exception in get_token_details: {e}")  # Debug log
-            await update.message.reply_text('An error occurred. Please try again later.')
+            await update.message.reply_text(f'An error occurred: {str(e)}')
             context.user_data.pop('trend_step', None)
             return
 
@@ -407,7 +830,7 @@ class TokenTrendingBot:
             await update.message.reply_text('Please enter the ticker symbol (e.g., MYTOKEN):')
             context.user_data['trend_step'] = 'ticker'
         except Exception:
-            await update.message.reply_text('An error occurred. Please try again later.')
+            await update.message.reply_text(f'An error occurred: {str(e)}')
             context.user_data.pop('trend_setup', None)
             context.user_data.pop('trend_step', None)
             return ConversationHandler.END
@@ -427,7 +850,7 @@ class TokenTrendingBot:
             context.user_data.pop('trend_setup', None)
             context.user_data.pop('trend_step', None)
         except Exception:
-            await update.message.reply_text('An error occurred. Please try again later.')
+            await update.message.reply_text(f'An error occurred: {str(e)}')
             context.user_data.pop('trend_setup', None)
             context.user_data.pop('trend_step', None)
             return ConversationHandler.END
@@ -467,6 +890,7 @@ class TokenTrendingBot:
         # Start platform-specific activities
         try:
             # Initialize modules based on selected platforms
+            # Only DexScreener trending is enabled. CMC and Twitter trending are disabled.
             if 'dextools' in setup['platforms'] or 'dexscreener' in setup['platforms']:
                 self.dex_module.simulate_activity(
                     setup['token_address'],
@@ -475,22 +899,20 @@ class TokenTrendingBot:
                     randomize=True,
                     proxy=True
                 )
-            
-            if 'cmc' in setup['platforms']:
-                self.cmc_module.generate_traffic(
-                    setup['token_address'],
-                    setup['engagement_level'],
-                    randomize=True,
-                    proxy=True
-                )
-            
-            if 'twitter' in setup['platforms']:
-                hashtag = f"#{setup['ticker']}"
-                self.twitter_module.automate_engagement(
-                    hashtag,
-                    setup['engagement_level'],
-                    randomize=True
-                )
+            # if 'cmc' in setup['platforms']:
+            #     self.cmc_module.generate_traffic(
+            #         setup['token_address'],
+            #         setup['engagement_level'],
+            #         randomize=True,
+            #         proxy=True
+            #     )
+            # if 'twitter' in setup['platforms']:
+            #     hashtag = f"#{setup['ticker']}"
+            #     self.twitter_module.automate_engagement(
+            #         hashtag,
+            #         setup['engagement_level'],
+            #         randomize=True
+            #     )
                 
             # Schedule automatic campaign end
             self.scheduler.schedule_trend(
@@ -837,13 +1259,13 @@ class TokenTrendingBot:
                 )
                 
             except Exception as wallet_error:
-                self.logger.log(f"Error in wallet creation process for user {user_id}: {str(wallet_error)}")
+                self.logger.log('Error in wallet creation', f'user {user_id}: {str(wallet_error)}')
                 await update.message.reply_text(
                     "❌ Error during wallet creation process. Please try again later."
                 )
                 
         except Exception as e:
-            self.logger.log(f"Error creating wallets for user {user_id}: {str(e)}")
+            self.logger.log('Error creating wallets', f'user {user_id}: {str(e)}')
             await update.message.reply_text(
                 "❌ Error creating wallets. Please try again later."
             )
