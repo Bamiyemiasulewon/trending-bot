@@ -64,95 +64,19 @@ class TokenTrendingBot:
             pass
 
     def _setup_handlers(self):
-        from telegram.ext import ConversationHandler, CallbackQueryHandler
-        # States for trend setup
-        (TREND_TOKEN_ADDRESS, TREND_CHAIN, TREND_TICKER, TREND_CONFIRM) = range(4)
-        # States for platform login flow
-        PLATFORM_SELECT, CMC_EMAIL, CMC_PASSWORD, DEX_EMAIL, DEX_PASSWORD, DEXT_EMAIL, DEXT_PASSWORD, TWITTER_USER, TWITTER_PASSWORD, TWITTER_2FA, CONFIRM_ANOTHER = range(5, 16)
-        
-        # Add handlers for wallet management
-        self.app.add_handler(CommandHandler('create_wallet', self.create_wallet))
-        self.app.add_handler(CommandHandler('fund_wallet', self.fund_wallet))
-        self.app.add_handler(CommandHandler('wallet_status', self.wallet_status))
-
-        # Create trend conversation handler
-        # States for trend setup
-        (TREND_TOKEN_ADDRESS, TREND_CHAIN, TREND_PLATFORMS, TREND_ENGAGEMENT, TREND_CONFIRM) = range(5)
-        
-        trend_handler = ConversationHandler(
-            entry_points=[CommandHandler('start_trend', self.start_trend)],
-            states={
-                TREND_TOKEN_ADDRESS: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_token_address),
-                    CommandHandler('check_payment', self.check_payment)
-                ],
-                TREND_CHAIN: [
-                    CallbackQueryHandler(self.get_chain, pattern='^(ETH|BNB|SOL)$')
-                ],
-                TREND_PLATFORMS: [
-                    CallbackQueryHandler(
-                        self.select_platforms,
-                        pattern='^platform_(twitter|cmc|dexscreener|dextools)$'
-                    ),
-                    CallbackQueryHandler(
-                        self.confirm_platforms,
-                        pattern='^platforms_done$'
-                    )
-                ],
-                TREND_ENGAGEMENT: [
-                    CallbackQueryHandler(
-                        self.set_engagement,
-                        pattern='^engagement_(low|medium|high)$'
-                    )
-                ],
-                TREND_CONFIRM: [
-                    CallbackQueryHandler(
-                        self.confirm_trend,
-                        pattern='^(confirm|cancel)$'
-                    )
-                ]
-            },
-            fallbacks=[
-                CommandHandler('cancel', self.cancel),
-                CommandHandler('check_payment', self.check_payment)
-            ],
-            name="trend_flow",
-            persistent=True
-        )
-        
-        # Add basic command handlers
-        self.app.add_handler(trend_handler)
+        from telegram.ext import MessageHandler, filters
         self.app.add_handler(CommandHandler('start', self.start))
+        self.app.add_handler(CommandHandler('start_trend', self.start_trend))
+        self.app.add_handler(CommandHandler('status', self.status))
         self.app.add_handler(CommandHandler('menu', self.menu))
         self.app.add_handler(CommandHandler('trend', self.trend))
         self.app.add_handler(CommandHandler('check_payment', self.check_payment))
         self.app.add_handler(CommandHandler('payment_history', self.payment_history))
-        self.app.add_handler(CommandHandler('status', self.status))
+        self.app.add_handler(CommandHandler('create_wallet', self.create_wallet))
+        self.app.add_handler(CommandHandler('fund_wallet', self.fund_wallet))
+        self.app.add_handler(CommandHandler('wallet_status', self.wallet_status))
         self.app.add_handler(CommandHandler('help', self.help))
-
-        # Create conversation handler for platform login flow
-        login_handler = ConversationHandler(
-            entry_points=[CommandHandler('login', self.login)],
-            states={
-                PLATFORM_SELECT: [CallbackQueryHandler(self.platform_select, pattern='^platform_(cmc|dexscreener|dextools|twitter)$')],
-                CMC_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.cmc_email)],
-                CMC_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.cmc_password)],
-                DEX_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.dex_email)],
-                DEX_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.dex_password)],
-                DEXT_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.dext_email)],
-                DEXT_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.dext_password)],
-                TWITTER_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.twitter_user)],
-                TWITTER_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.twitter_password)],
-                TWITTER_2FA: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.twitter_2fa)],
-                'LOGOUT_SELECT': [CallbackQueryHandler(self.logout_select, pattern='^(cmc|dexscreener|dextools|twitter)$')],
-                'RECONNECT_SELECT': [CallbackQueryHandler(self.reconnect_select, pattern='^(cmc|dexscreener|dextools|twitter)$')],
-            },
-            fallbacks=[CommandHandler('cancel', self.cancel)],
-            per_message=False,  # Track conversation per user and chat, not per message
-            per_chat=True,      # Track conversation per chat
-            per_user=True      # Track conversation per user
-        )
-        self.app.add_handler(login_handler)  # Fixed variable name from conv_handler to login_handler
+        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_token_details))
 
     async def login(self, update, context):
         user_id = update.effective_user.id
@@ -406,43 +330,20 @@ class TokenTrendingBot:
         await update.message.reply_text('Use /start_trend <token_address> <chain> <platforms> <engagement> to begin a campaign.')
 
     async def start_trend(self, update, context):
-        """Streamlined trending setup: prompt for token address, chain, ticker in sequence"""
+        """Collect all token details in one message."""
         try:
-            # Clear any previous trend data
-            context.user_data['trend_setup'] = {}
-            await update.message.reply_text('Please enter the token address:')
-
-            if not connected_platforms:
-                await update.message.reply_text(
-                    "❌ No platforms connected!\n\n"
-                    "Please use /login to connect at least one platform:\n"
-                    "- CoinMarketCap\n"
-                    "- DEXScreener\n"
-                    "- DEXTools\n"
-                    "- Twitter"
-                )
-                return ConversationHandler.END
-
-            # Clear any previous trend data
-            if 'trend_setup' in context.user_data:
-                context.user_data.pop('trend_setup')
-            context.user_data['trend_setup'] = {
-                'user_id': user_id,
-                'connected_platforms': connected_platforms
-            }
-            # Now prompt for token address
-            await update.message.reply_text('🔗 Please enter your token address:')
-            return TREND_TOKEN_ADDRESS
-        except Exception as e:
-            tb = traceback.format_exc()
-            self.logger.log('start_trend_error', f"Exception: {e}\nTraceback:\n{tb}")
-            await update.message.reply_text('An error occurred. Please try again later. (Error logged)')
+            await update.message.reply_text(
+                "Please provide your token details in this format:\n[Token Address] [Chain] [Ticker]\n\n"
+                "Example: 0x1234...abcd ETH MYTOKEN\n\nSupported chains: ETH, BNB, SOL (or full forms: Ethereum, BNB Chain, Solana)\nNote: You can use any amount of spaces between the fields."
+            )
+            context.user_data['trend_step'] = 'collect_all'
+        except Exception:
+            await update.message.reply_text('An error occurred. Please try again later.')
+            context.user_data.pop('trend_step', None)
             return ConversationHandler.END
 
         campaign_id = f"TREND_{int(time.time())}"
         context.user_data['campaign_id'] = campaign_id
-        context.user_data['is_testnet'] = is_testnet
-
         # Check user's connection status
         connections = context.user_data.get('connections', self.load_connections(user_id))
         connected_platforms = [p for p, v in connections.items() if v]
@@ -462,70 +363,74 @@ class TokenTrendingBot:
         if 'trend_setup' in context.user_data:
             context.user_data.pop('trend_setup')
         context.user_data['trend_setup'] = {
-            'user_id': user_id,
-            'connected_platforms': connected_platforms
+            'token_address': None,
+            'chain': None,
+            'ticker': None,
+            'platforms': None,
+            'engagement_level': None,
+            'payment_id': None
         }
-    async def get_token_address(self, update, context):
-        """Step 1: Prompt for token address, then ask for chain"""
-        token_address = update.message.text.strip()
-        # Basic validation for Ethereum/BSC address
-        if not (token_address.startswith('0x') and len(token_address) == 42 and all(c in '0123456789abcdefABCDEF' for c in token_address[2:])):
-            await update.message.reply_text('❌ Invalid token address format. Please enter a valid Ethereum/BSC address (0x...).')
-            return TREND_TOKEN_ADDRESS
-        context.user_data['trend_setup']['token_address'] = token_address
-        await update.message.reply_text('Please select/enter the blockchain chain:')
-        return TREND_CHAIN
+
+    async def get_token_details(self, update, context):
+        """Collect all details from one message, parse and confirm."""
+        try:
+            # Always process as token details after /start_trend
+            text = update.message.text.strip()
+            print(f"[DEBUG] Received user input: {text}")  # Debug log
+            parts = text.split()
+            if len(parts) != 3:
+                await update.message.reply_text("Invalid format. Please provide: [Token Address] [Chain] [Ticker]")
+                return
+            token_address, chain, ticker = parts
+            await update.message.reply_text(
+                f"✅ Token added successfully!\n\nDetails:\nToken Address: {token_address}\nChain: {chain}\nTicker: {ticker}"
+            )
+            context.user_data['trend_setup'] = {
+                'token_address': token_address,
+                'chain': chain,
+                'ticker': ticker
+            }
+            context.user_data.pop('trend_step', None)
+        except Exception as e:
+            print(f"[DEBUG] Exception in get_token_details: {e}")  # Debug log
+            await update.message.reply_text('An error occurred. Please try again later.')
+            context.user_data.pop('trend_step', None)
+            return
 
     async def get_chain(self, update, context):
-        """Step 2: Prompt for chain, then ask for ticker (text-based, no callback)"""
-        chain = update.message.text.strip().upper()
-        valid_chains = ['ETH', 'BSC', 'BNB', 'SOL', 'POLYGON', 'AVAX']
-        if chain not in valid_chains:
-            await update.message.reply_text(f'❌ Invalid chain. Please enter one of: {", ".join(valid_chains)}')
-            return TREND_CHAIN
-        context.user_data['trend_setup']['chain'] = chain
-        await update.message.reply_text('Please enter the ticker symbol:')
-        return TREND_TICKER
-        
-        # Update payment record with chain
-        payment_id = context.user_data['trend_setup'].get('payment_id')
-        if payment_id:
-            self.payment_manager.update_payment_chain(payment_id, chain)
-        
+        """Step 2: Collect chain, prompt for ticker."""
+        try:
+            if context.user_data.get('trend_step') != 'chain':
+                return await self.start_trend(update, context)
+            chain = update.message.text.strip()
+            context.user_data['trend_setup']['chain'] = chain
+            await update.message.reply_text('Please enter the ticker symbol (e.g., MYTOKEN):')
+            context.user_data['trend_step'] = 'ticker'
+        except Exception:
+            await update.message.reply_text('An error occurred. Please try again later.')
+            context.user_data.pop('trend_setup', None)
+            context.user_data.pop('trend_step', None)
+            return ConversationHandler.END
 
     async def get_ticker(self, update, context):
-        """Step 3: Prompt for ticker, then show confirmation and start session (no platform/payment logic)"""
-        ticker = update.message.text.strip().upper()
-        if not (2 <= len(ticker) <= 10 and ticker.isalnum()):
-            await update.message.reply_text('❌ Invalid ticker. Please enter a valid ticker symbol (2-10 letters/numbers).')
-            return TREND_TICKER
-        context.user_data['trend_setup']['ticker'] = ticker
-        session = context.user_data['trend_setup']
-        msg = (
-            "Trending session started successfully!\n\n"
-            f"Token Address: {session['token_address']}\n"
-            f"Chain: {session['chain']}\n"
-            f"Ticker: {session['ticker']}\n"
-        )
-        await update.message.reply_text(msg)
-        # Wire up DEXScreener trending logic (BNB only)
-        if session['chain'] == 'BNB':
-            try:
-                await update.message.reply_text("🚀 Initiating trending simulation on PancakeSwap (BNB chain) for DEXScreener...")
-                import asyncio
-                loop = asyncio.get_event_loop()
-                # Run simulate_activity in executor to avoid blocking
-                await loop.run_in_executor(None, self.dex_module.simulate_activity, session['token_address'], session['chain'], 'high')
-                await update.message.reply_text("✅ DEXScreener trending simulation completed!")
-                self.logger.log('trend_success', f"Simulated trending for {session['token_address']} on BNB.")
-            except Exception as e:
-                import traceback
-                tb = traceback.format_exc()
-                self.logger.log('trend_error', f"Exception: {e}\nTraceback:\n{tb}")
-                await update.message.reply_text(f"❌ Failed to simulate trending: {e}")
-        else:
-            await update.message.reply_text("⚠️ Automated trending is currently only supported for BNB chain.")
-        return ConversationHandler.END
+        """Step 3: Collect ticker, display summary."""
+        try:
+            if context.user_data.get('trend_step') != 'ticker':
+                return await self.start_trend(update, context)
+            ticker = update.message.text.strip()
+            context.user_data['trend_setup']['ticker'] = ticker
+            session = context.user_data['trend_setup']
+            msg = (
+                f"Token added successfully! Details: Token Address: {session.get('token_address')}, Chain: {session.get('chain')}, Ticker: {session.get('ticker')}."
+            )
+            await update.message.reply_text(msg)
+            context.user_data.pop('trend_setup', None)
+            context.user_data.pop('trend_step', None)
+        except Exception:
+            await update.message.reply_text('An error occurred. Please try again later.')
+            context.user_data.pop('trend_setup', None)
+            context.user_data.pop('trend_step', None)
+            return ConversationHandler.END
             
     async def confirm_trend(self, update, context):
         """Handle trend confirmation"""
