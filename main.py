@@ -3,6 +3,7 @@ import json
 import logging
 import traceback
 import asyncio
+import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from dotenv import load_dotenv
@@ -316,103 +317,183 @@ class TokenTrendingBot:
             # Show the updated menu
             await self.menu(update, context)
             
+    def get_web3_instance(self):
+        """Get a working Web3 instance with fallback RPC endpoints."""
+        rpc_endpoints = [
+            'https://bsc-dataseed1.defibit.io',
+            'https://bsc-dataseed2.defibit.io',
+            'https://bsc-dataseed1.binance.org',
+            'https://bsc-dataseed2.binance.org',
+            'https://bsc-dataseed3.binance.org',
+            'https://bsc-dataseed4.binance.org',
+            'https://bsc-dataseed.binance.org',
+            'https://bsc-dataseed1.ninicoin.io',
+            'https://bsc-dataseed2.ninicoin.io',
+            'https://bsc.nodereal.io',
+        ]
+        
+        for endpoint in rpc_endpoints:
+            try:
+                provider = HTTPProvider(endpoint, request_kwargs={
+                    'timeout': 10,
+                    'proxies': {
+                        'http': '',
+                        'https': ''
+                    }
+                })
+                w3 = Web3(provider)
+                if w3.is_connected():
+                    return w3
+            except Exception as e:
+                self.logger.warning(f"Failed to connect to {endpoint}: {str(e)}")
+                continue
+                
+        raise Exception("Could not connect to any BSC RPC endpoint")
+
     async def get_bnb_price(self):
-        """Fetch current BNB/USD price from Binance API."""
+        """Fetch the current BNB price in USD with multiple fallbacks."""
+        # Try Binance first
         try:
             url = "https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT"
-            response = requests.get(url)
-            if response.status_code == 200:
-                data = response.json()
-                return float(data['price'])
+            response = requests.get(url, timeout=10, 
+                                 headers={'User-Agent': 'Mozilla/5.0'},
+                                 verify=True)
+            response.raise_for_status()
+            data = response.json()
+            return float(data['price'])
         except Exception as e:
-            self.logger.error(f"Error fetching BNB price: {str(e)}")
-        
-        # Fallback to hardcoded price if API fails
-        return 300.0  # Conservative estimate if API fails
+            self.logger.warning(f"Failed to fetch BNB price from Binance: {str(e)}")
+            
+        # Fallback to CoinGecko
+        try:
+            url = "https://api.coingecko.com/api/v3/simple/price?ids=binancecoin&vs_currencies=usd"
+            response = requests.get(url, timeout=10,
+                                 headers={'User-Agent': 'Mozilla/5.0'},
+                                 verify=True)
+            response.raise_for_status()
+            data = response.json()
+            return float(data['binancecoin']['usd'])
+        except Exception as e:
+            self.logger.warning(f"Failed to fetch BNB price from CoinGecko: {str(e)}")
+            
+        # Fallback to PancakeSwap API
+        try:
+            url = "https://api.pancakeswap.info/api/v2/tokens/0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"  # WBNB token
+            response = requests.get(url, timeout=10,
+                                 headers={'User-Agent': 'Mozilla/5.0'},
+                                 verify=True)
+            response.raise_for_status()
+            data = response.json()
+            return float(data['data']['price'])
+        except Exception as e:
+            self.logger.warning(f"Failed to fetch BNB price from PancakeSwap: {str(e)}")
+            
+        # Final fallback to hardcoded price
+        self.logger.warning("Using hardcoded BNB price as fallback")
+        return 300.0  # Conservative estimate if all APIs fail
 
     async def fund_wallet(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start the wallet funding process with dynamic BNB/USD calculation."""
-        if not self.central_wallet_address or not self.central_wallet_private_key:
+        if not hasattr(self, 'central_wallet_address') or not self.central_wallet_address:
             await update.message.reply_text(
-                "❌ Central wallet not configured. Please set CENTRAL_WALLET_ADDRESS and "
-                "CENTRAL_WALLET_PRIVATE_KEY in your .env file."
+                "❌ Central wallet not configured. "
+                "Please set CENTRAL_WALLET_ADDRESS and CENTRAL_WALLET_PRIVATE_KEY in your .env file."
             )
             return
             
-        if not self.wallets:
-            await update.message.reply_text("❌ No wallets found. Please create wallets first using /create_wallet.")
-            return
-            
+        # Get current BNB price
         try:
-            # Get current BNB price and central wallet balance
             bnb_price = await self.get_bnb_price()
+            if not bnb_price:
+                raise ValueError("Could not fetch BNB price")
+                
+            # Get central wallet balance
             balance_wei = self.web3.eth.get_balance(self.central_wallet_address)
-            balance_bnb = float(Web3.from_wei(balance_wei, 'ether'))
-            balance_usd = balance_bnb * bnb_price
+            balance_bnb = self.web3.from_wei(balance_wei, 'ether')
+            balance_usd = float(balance_bnb) * bnb_price
             
-            # Calculate how many full $1 increments we can distribute after keeping $1
-            min_central_balance_usd = 1.0  # Always keep exactly $1 in central wallet
-            available_usd = balance_usd - min_central_balance_usd
-            
-            if available_usd < 1.0:
-                await update.message.reply_text(
-                    f"❌ Need at least ${min_central_balance_usd + 1:.2f} to fund 1 wallet\n"
-                    f"• Current: ${balance_usd:.2f} ({balance_bnb:.6f} BNB)\n"
-                    f"• BNB Price: ${bnb_price:.4f}\n\n"
-                    f"Send at least ${(min_central_balance_usd + 1 - available_usd):.2f} more to:\n"
-                    f"`{self.central_wallet_address}`"
+            # Calculate how many wallets we can fund
+            min_required_usd = 2.00  # $1 per wallet + $1 reserve
+            if balance_usd < min_required_usd:
+                needed_usd = min_required_usd - balance_usd
+                needed_bnb = needed_usd / bnb_price
+                
+                # Create a clickable link for BSCScan
+                bsc_scan_link = f"https://bscscan.com/address/{self.central_wallet_address}"
+                
+                # Format the message with proper escaping for MarkdownV2
+                # Escape all special MarkdownV2 characters in dynamic content
+                min_required_escaped = str(min_required_usd).replace('.', '\.')
+                balance_usd_escaped = str(round(balance_usd, 2)).replace('.', '\.')
+                balance_bnb_escaped = str(round(balance_bnb, 6)).replace('.', '\.')
+                bnb_price_escaped = str(round(bnb_price, 4)).replace('.', '\.')
+                needed_usd_escaped = str(round(needed_usd, 2)).replace('.', '\.')
+                
+                message = (
+                    f"❌ *Need at least ${min_required_escaped} to fund 1 wallet*\n"
+                    f"• *Current*: ${balance_usd_escaped} \\(`{balance_bnb_escaped} BNB\\)\n"
+                    f"• *BNB Price*: \${bnb_price_escaped}\n\n"
+                    f"Send at least *\${needed_usd_escaped}* more to\:\n"
+                    f"```\n{self.central_wallet_address}\n```\n"
+                    f"[View on BSCScan]({bsc_scan_link})\n\n"
+                    "After sending, use /check\\_balance to verify the transaction\."
                 )
+                
+                # Send the message with MarkdownV2 parse mode
+                try:
+                    await update.message.reply_text(
+                        message,
+                        parse_mode='MarkdownV2',
+                        disable_web_page_preview=True
+                    )
+                except Exception as e:
+                    self.logger.error(f"Error sending message: {str(e)}")
+                    # Fallback to plain text if Markdown parsing fails
+                    plain_message = (
+                        f"❌ Need at least ${min_required_usd:.2f} to fund 1 wallet\n"
+                        f"• Current: ${balance_usd:.2f} ({balance_bnb:.6f} BNB)\n"
+                        f"• BNB Price: ${bnb_price:.4f}\n\n"
+                        f"Send at least ${needed_usd:.2f} more to:\n"
+                        f"{self.central_wallet_address}\n\n"
+                        f"View on BSCScan: {bsc_scan_link}\n\n"
+                        "After sending, use /check_balance to verify the transaction."
+                    )
+                    await update.message.reply_text(plain_message)
                 return
                 
-            wallets_to_fund = min(int(available_usd), len(self.wallets))
+            # Calculate how many wallets we can fund
+            max_wallets = int((balance_usd - 1.00) / 1.00)  # Leave $1 for gas
+            max_wallets = min(max_wallets, 34)  # Max 34 wallets
             
-            if wallets_to_fund == 0:
-                await update.message.reply_text(
-                    f"❌ Insufficient balance. Need at least ${min_central_balance_usd + 1:.2f} "
-                    f"worth of BNB to fund at least 1 wallet.\n\n"
-                    f"• Current balance: ${balance_usd:.2f} ({balance_bnb:.4f} BNB)\n"
-                    f"• Current BNB price: ${bnb_price:.2f}\n\n"
-                    f"Please send BNB to:\n`{self.central_wallet_address}`"
-                )
-                return
+            bnb_per_wallet = 1.00 / bnb_price  # $1 worth of BNB per wallet
+            total_bnb = bnb_per_wallet * max_wallets
             
-            # Calculate BNB amount per wallet (exactly $1 worth)
-            bnb_per_wallet = 1.0 / bnb_price
-            total_bnb_needed = bnb_per_wallet * wallets_to_fund
-            remaining_bnb = balance_bnb - total_bnb_needed
-            remaining_usd = remaining_bnb * bnb_price
-            
-            # Store funding details in context
-            context.user_data['funding_details'] = {
+            funding_details = {
+                'max_wallets': max_wallets,
                 'bnb_per_wallet': bnb_per_wallet,
-                'wallets_to_fund': wallets_to_fund,
-                'total_bnb': total_bnb_needed,
-                'bnb_price': bnb_price,
-                'remaining_bnb': remaining_bnb,
-                'remaining_usd': remaining_usd
+                'total_bnb': total_bnb,
+                'bnb_price': bnb_price
             }
+            
+            context.user_data['funding_details'] = funding_details
             context.user_data['awaiting_funding_confirmation'] = True
             
-            # Show funding plan
             await update.message.reply_text(
-                f"💰 *Funding Plan* 💰\n\n"
-                f"• BNB Price: ${bnb_price:.4f}\n"
-                f"• Current Balance: {balance_bnb:.6f} BNB (${balance_usd:.2f})\n\n"
-                f"• Will retain: 1.0 BNB (≈${min_central_balance_usd:.2f}) in central wallet\n"
-                f"• Wallets to fund: {wallets_to_fund} with ${1.00:.2f} each\n"
-                f"• BNB per wallet: {bnb_per_wallet:.8f} BNB\n"
-                f"• Total to distribute: {total_bnb_needed:.8f} BNB\n"
-                f"• Remaining after: {remaining_bnb:.8f} BNB (≈${remaining_usd:.2f})\n\n"
-                "Type `confirm` to proceed or /cancel to abort.",
+                f"💰 *Funding Plan*\n"
+                f"• Wallets to fund: {max_wallets}\n"
+                f"• BNB per wallet: {bnb_per_wallet:.6f} (${1.00:.2f})\n"
+                f"• Total BNB needed: {total_bnb:.6f}\n"
+                f"• Current BNB price: ${bnb_price:.2f}\n\n"
+                f"Type `confirm` to proceed or /cancel to cancel.",
                 parse_mode='Markdown'
             )
             
         except Exception as e:
-            self.logger.error(f"Error in fund_wallet: {str(e)}")
+            self.logger.error(f"Error in fund_wallet: {str(e)}", exc_info=True)
             await update.message.reply_text(
-                f"❌ Error: {str(e)}\nPlease try again later."
+                "❌ An error occurred while checking balances. Please try again later."
             )
-    
+
     async def handle_funding_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle funding confirmation from user."""
         user_input = update.message.text.strip().lower()
@@ -448,12 +529,12 @@ class TokenTrendingBot:
             return
             
         bnb_per_wallet = funding_details['bnb_per_wallet']
-        wallets_to_fund = funding_details['wallets_to_fund']
+        max_wallets = funding_details['max_wallets']
         
         try:
             # Recheck balance in case it changed
             balance_wei = self.web3.eth.get_balance(self.central_wallet_address)
-            balance_bnb = float(Web3.from_wei(balance_wei, 'ether'))
+            balance_bnb = float(self.web3.from_wei(balance_wei, 'ether'))
             
             # Adjust if balance changed since plan was made
             min_balance_needed = funding_details['total_bnb'] + (1.0 / funding_details['bnb_price'])
@@ -467,11 +548,11 @@ class TokenTrendingBot:
                     )
                     return
                 
-                wallets_to_fund = adjusted_wallets
-                funding_details['wallets_to_fund'] = wallets_to_fund
+                max_wallets = adjusted_wallets
+                funding_details['max_wallets'] = max_wallets
                 
                 await update.message.reply_text(
-                    f"⚠️ Balance decreased. Will now fund {wallets_to_fund} wallets."
+                    f"⚠️ Balance decreased. Will now fund {max_wallets} wallets."
                 )
                 
             # Start funding process
@@ -479,10 +560,10 @@ class TokenTrendingBot:
             success_count = 0
             funded_wallets = []
             
-            for i, wallet in enumerate(self.wallets[:wallets_to_fund], 1):
+            for i, wallet in enumerate(self.wallets[:max_wallets], 1):
                 try:
                     # Check if we still have enough balance (in case of network fees)
-                    current_balance = float(Web3.from_wei(
+                    current_balance = float(self.web3.from_wei(
                         self.web3.eth.get_balance(self.central_wallet_address), 'ether'
                     ))
                     
@@ -496,7 +577,7 @@ class TokenTrendingBot:
                     # Calculate gas cost
                     gas_price = self.web3.eth.gas_price
                     gas_limit = 21000  # Standard transfer gas limit
-                    gas_cost = Web3.from_wei(gas_price * gas_limit, 'ether')
+                    gas_cost = self.web3.from_wei(gas_price * gas_limit, 'ether')
                     
                     # Amount to send (BNB per wallet minus gas cost)
                     send_amount = bnb_per_wallet - float(gas_cost)
@@ -508,7 +589,7 @@ class TokenTrendingBot:
                     tx = {
                         'nonce': nonce,
                         'to': wallet['address'],
-                        'value': Web3.to_wei(send_amount, 'ether'),
+                        'value': self.web3.to_wei(send_amount, 'ether'),
                         'gas': gas_limit,
                         'gasPrice': gas_price,
                         'chainId': 56  # BSC Mainnet
@@ -525,9 +606,9 @@ class TokenTrendingBot:
                         self.logger.info(f"Successfully funded {wallet['address']} with {send_amount:.6f} BNB")
                         
                         # Update status message every 2 wallets
-                        if success_count % 2 == 0 or i == wallets_to_fund:
+                        if success_count % 2 == 0 or i == max_wallets:
                             await status_msg.edit_text(
-                                f"🔄 Funding in progress... {success_count}/{wallets_to_fund} wallets funded\n"
+                                f"🔄 Funding in progress... {success_count}/{max_wallets} wallets funded\n"
                                 f"• Current balance: {current_balance:.6f} BNB\n"
                                 f"• Last funded: {wallet['address'][:10]}...{wallet['address'][-6:]}"
                             )
@@ -545,13 +626,13 @@ class TokenTrendingBot:
                 json.dump(self.token_config, f, indent=2)
             
             # Final status update
-            final_balance = float(Web3.from_wei(
+            final_balance = float(self.web3.from_wei(
                 self.web3.eth.get_balance(self.central_wallet_address), 'ether'
             ))
             
             await status_msg.edit_text(
                 f"✅ Funding complete!\n\n"
-                f"• Successfully funded: {success_count}/{wallets_to_fund} wallets\n"
+                f"• Successfully funded: {success_count}/{max_wallets} wallets\n"
                 f"• Amount per wallet: {bnb_per_wallet:.6f} BNB (≈$1.00)\n"
                 f"• Total distributed: {success_count * bnb_per_wallet:.6f} BNB\n"
                 f"• Remaining balance: {final_balance:.6f} BNB\n\n"
@@ -567,57 +648,76 @@ class TokenTrendingBot:
     
     async def check_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Check the balance of the central wallet and all trading wallets."""
-        if not self.wallets:
-            await update.message.reply_text("❌ No wallets found. Please create wallets first using /create_wallet.")
+        if not hasattr(self, 'central_wallet_address') or not self.central_wallet_address:
+            await update.message.reply_text("❌ Central wallet not configured.")
             return
             
         try:
+            # Show typing action
+            await update.message.reply_chat_action('typing')
+            
+            # Get BNB price
+            bnb_price = await self.get_bnb_price()
+            if not bnb_price:
+                raise ValueError("Could not fetch BNB price")
+                
             # Check central wallet balance
-            central_balance_wei = self.web3.eth.get_balance(self.central_wallet_address)
-            central_balance = float(Web3.from_wei(central_balance_wei, 'ether'))
+            balance_wei = self.web3.eth.get_balance(self.central_wallet_address)
+            balance_bnb = self.web3.from_wei(balance_wei, 'ether')
+            balance_usd = float(balance_bnb) * bnb_price
             
-            # Check each wallet's balance
-            balances = []
-            total_balance = 0
-            
-            for i, wallet in enumerate(self.wallets, 1):
-                try:
-                    balance_wei = self.web3.eth.get_balance(wallet['address'])
-                    balance_bnb = float(Web3.from_wei(balance_wei, 'ether'))
-                    total_balance += balance_bnb
-                    
-                    # Only include wallets with balance > 0.001 BNB in the detailed list
-                    if balance_bnb > 0.001:
-                        balances.append(f"• Wallet {i}: {balance_bnb:.4f} BNB")
-                        
-                except Exception as e:
-                    self.logger.error(f"Error checking balance for wallet {wallet['address']}: {str(e)}")
-            
-            # Prepare the message
-            message = (
-                f"💰 *Wallet Balances* 💰\n\n"
-                f"*Central Wallet*\n"
-                f"• Address: `{self.central_wallet_address}`\n"
-                f"• Balance: {central_balance:.4f} BNB\n\n"
-                f"*Trading Wallets*\n"
-                f"• Total wallets: {len(self.wallets)}\n"
-                f"• Total balance: {total_balance:.4f} BNB\n"
-                f"• Average balance: {total_balance/len(self.wallets):.4f} BNB\n\n"
+            # Format the response
+            response = (
+                "💰 *Wallet Balances*\n\n"
+                f"*Central Wallet* (`{self.central_wallet_address[:6]}...{self.central_wallet_address[-4:]}`):\n"
+                f"• {balance_bnb:.6f} BNB (${balance_usd:.2f})\n"
             )
             
-            # Add top 10 wallets by balance if any
-            if balances:
-                message += "*Top Wallets by Balance*\n"
-                message += "\n".join(balances[:10])  # Show top 10 to avoid message length issues
-                if len(balances) > 10:
-                    message += f"\n...and {len(balances) - 10} more wallets with balance > 0.001 BNB"
+            # Add BSCScan link for central wallet
+            bsc_scan_link = f"https://bscscan.com/address/{self.central_wallet_address}"
+            response += f"• [View on BSCScan]({bsc_scan_link})\n\n"
             
-            await update.message.reply_text(message, parse_mode='Markdown')
+            # Check trading wallets if they exist
+            if hasattr(self, 'wallets') and self.wallets:
+                response += "*Trading Wallets:*\n"
+                total_balance_bnb = 0
+                
+                for i, wallet in enumerate(self.wallets, 1):
+                    try:
+                        wallet_balance_wei = self.web3.eth.get_balance(wallet['address'])
+                        wallet_balance_bnb = self.web3.from_wei(wallet_balance_wei, 'ether')
+                        wallet_balance_usd = float(wallet_balance_bnb) * bnb_price
+                        total_balance_bnb += float(wallet_balance_bnb)
+                        
+                        wallet_link = f"https://bscscan.com/address/{wallet['address']}"
+                        response += (
+                            f"{i}. `{wallet['address'][:6]}...{wallet['address'][-4:]}`\n"
+                            f"   • Balance: {wallet_balance_bnb:.6f} BNB (${wallet_balance_usd:.2f})\n"
+                            f"   • [View on BSCScan]({wallet_link})\n\n"
+                        )
+                    except Exception as e:
+                        self.logger.error(f"Error checking wallet {wallet['address']}: {str(e)}")
+                        response += f"{i}. `{wallet['address'][:6]}...`: Error checking balance\n\n"
+                
+                # Add total
+                total_balance_usd = total_balance_bnb * bnb_price
+                response += (
+                    f"*Total Trading Wallets Balance:*\n"
+                    f"• {total_balance_bnb:.6f} BNB (${total_balance_usd:.2f})\n"
+                )
             
-        except Exception as e:
-            self.logger.error(f"Error checking wallet balances: {str(e)}")
+            # Add refresh button
+            response += "\n🔄 Use /check_balance to refresh"
+            
             await update.message.reply_text(
-                "❌ Error checking wallet balances. Please try again later."
+                response,
+                parse_mode='Markdown',
+                disable_web_page_preview=True
+            )
+        except Exception as e:
+            self.logger.error(f"Error in check_balance: {str(e)}")
+            await update.message.reply_text(
+                "❌ An error occurred while checking balances. Please try again later."
             )
     
     async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
