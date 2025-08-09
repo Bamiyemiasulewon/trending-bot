@@ -1,21 +1,74 @@
 import os
-from web3 import Web3
-from eth_account import Account
-from solana.keypair import Keypair
 import json
 import logging
-from typing import Dict, List, Optional
+import random
+import asyncio
+from typing import Dict, List, Optional, Tuple
 from pathlib import Path
+from decimal import Decimal
+from web3 import Web3, HTTPProvider
+# POA middleware is included by default in web3.py v7 for BSC
+from eth_account import Account
+from eth_abi import encode_abi
+from hexbytes import HexBytes
+
+from trading_config import (
+    MIN_WALLET_BALANCE,
+    TOP_UP_AMOUNT,
+    PANCAKE_ROUTER,
+    TOKEN_PAIRS,
+    GAS_PRICE,
+    SLIPPAGE,
+    TRADE_AMOUNT,
+    TRADING_MODES
+)
 
 class WalletManager:
-    def __init__(self, config_path: str = None):
+    def __init__(self, config_path: str = None, rpc_url: str = None):
         self.config_path = config_path or os.path.join(os.path.dirname(__file__), 'wallet_config.json')
-        self.wallets: Dict[str, List[Dict]] = {
-            'ETH': [],
-            'BNB': [],
-            'SOL': []
-        }
+        self.wallets: Dict[str, List[Dict]] = {'BNB': []}  # Focus on BNB chain only
         self.load_wallets()
+        
+        # Initialize Web3
+        self.rpc_url = rpc_url or os.getenv('BSC_MAINNET_RPC')
+        if not self.rpc_url:
+            raise ValueError("BSC_MAINNET_RPC not found in environment variables")
+            
+        self.w3 = Web3(HTTPProvider(self.rpc_url))
+        self.w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+        
+        # Load PancakeSwap Router ABI
+        with open(os.path.join(os.path.dirname(__file__), 'pancakeswap_router_abi.json')) as f:
+            self.router_abi = json.load(f)
+            
+        self.router_contract = self.w3.eth.contract(
+            address=Web3.to_checksum_address(PANCAKE_ROUTER),
+            abi=self.router_abi
+        )
+        
+        # ERC20 ABI for token interactions
+        self.erc20_abi = [
+            {
+                'constant': True,
+                'inputs': [{'name': '_owner', 'type': 'address'}],
+                'name': 'balanceOf',
+                'outputs': [{'name': 'balance', 'type': 'uint256'}],
+                'type': 'function'
+            },
+            {
+                'constant': False,
+                'inputs': [
+                    {'name': '_spender', 'type': 'address'},
+                    {'name': '_value', 'type': 'uint256'}
+                ],
+                'name': 'approve',
+                'outputs': [{'name': 'success', 'type': 'bool'}],
+                'type': 'function'
+            }
+        ]
+        
+        self.logger = logging.getLogger('WalletManager')
+        self.logger.setLevel(logging.INFO)
         
     def load_wallets(self):
         """Load wallet configurations from file"""
@@ -37,14 +90,19 @@ class WalletManager:
         except Exception as e:
             logging.error(f"Failed to save wallet config: {str(e)}")
             
-    def create_eth_wallet(self) -> Dict:
-        """Create a new Ethereum/BSC wallet"""
+    def create_bnb_wallet(self) -> Dict:
+        """Create a new BSC wallet"""
         account = Account.create()
         wallet = {
             'address': account.address,
             'private_key': account.key.hex(),
-            'balance': 0
+            'balance': 0,
+            'nonce': 0,
+            'last_used': None,
+            'is_active': True
         }
+        self.wallets['BNB'].append(wallet)
+        self.save_wallets()
         return wallet
         
     def create_sol_wallet(self) -> Dict:
