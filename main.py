@@ -3,6 +3,7 @@ import json
 import logging
 import traceback
 import asyncio
+import time
 import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
@@ -18,11 +19,17 @@ nest_asyncio.apply()
 class TokenTrendingBot:
     def __init__(self):
         """Initializes the bot, loads configuration, and sets up handlers."""
-        load_dotenv()
-        self.token = os.getenv("TELEGRAM_BOT_TOKEN")
+        # Load environment variables from project root .env file
+        env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
+        if os.path.exists(env_path):
+            load_dotenv(env_path)
+        else:
+            load_dotenv()  # Fallback to default .env location
+            
+        self.token = os.getenv("TELEGRAM_TOKEN")
         if not self.token:
-            raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set.")
-        
+            raise ValueError("TELEGRAM_TOKEN environment variable not found in .env file")
+            
         self.app = Application.builder().token(self.token).build()
 
         # This will hold the loaded wallets for the session
@@ -36,91 +43,17 @@ class TokenTrendingBot:
         )
         self.logger = logging.getLogger(__name__)
         
-        # Initialize Web3 with multiple fallback RPC endpoints
-        bsc_rpc_urls = [
-            'https://bsc-dataseed1.defibit.io/',  # Moved most reliable first
-            'https://bsc-dataseed2.defibit.io/',
-            'https://bsc-dataseed3.defibit.io/',
-            'https://bsc-dataseed4.defibit.io/',
-            'https://bsc-dataseed1.ninicoin.io/',
-            'https://bsc-dataseed2.ninicoin.io/',
-            'https://bsc-dataseed3.ninicoin.io/',
-            'https://bsc-dataseed4.ninicoin.io/',
-            'https://bsc-dataseed.binance.org/',  # Moved default to end as it's often rate-limited
-        ]
+        # Initialize BNB price cache
+        self._bnb_price_cache = {
+            'price': 300.0,  # Default fallback price
+            'timestamp': 0,
+            'ttl': 300  # 5 minutes in seconds
+        }
         
+        # Initialize Web3 connection
         self.web3 = None
-        for url in bsc_rpc_urls:
-            try:
-                self.logger.info(f"Attempting to connect to: {url}")
-                # Add headers to mimic browser request
-                headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-                }
-                provider = HTTPProvider(
-                    url, 
-                    request_kwargs={
-                        'timeout': 15,  # Increased timeout
-                        'headers': headers
-                    }
-                )
-                web3 = Web3(provider)
-                
-                # Test connection with a simple call
-                block = web3.eth.block_number
-                if not isinstance(block, int) or block < 0:
-                    raise ValueError("Invalid block number received")
-                    
-                self.logger.info(f"Successfully connected to BSC node. Current block: {block}")
-                self.web3 = web3
-                self.logger.info(f"Successfully connected to BSC node: {url}")
-                
-                # Test a transaction call to ensure full functionality
-                try:
-                    gas_price = web3.eth.gas_price
-                    if not isinstance(gas_price, int) or gas_price <= 0:
-                        raise ValueError("Invalid gas price received")
-                    self.logger.info(f"Node fully operational. Current gas price: {web3.from_wei(gas_price, 'gwei')} Gwei")
-                except Exception as e:
-                    self.logger.warning(f"Node partially functional: {str(e)}")
-                    
-                break
-            except Exception as e:
-                self.logger.error(f"Failed to connect to {url}: {str(e)}", exc_info=True)
-                continue
+        self.initialize_web3()
         
-        # If all connection attempts failed
-        if not self.web3:
-            # Try a direct connection test using requests as a fallback
-            try:
-                import requests
-                test_url = 'https://bsc-dataseed.binance.org/'
-                self.logger.info(f"Testing direct connection to {test_url}")
-                response = requests.get(test_url, timeout=10)
-                if response.status_code == 200:
-                    self.logger.info("Direct connection test successful, but Web3 connection failed")
-                else:
-                    self.logger.error(f"Direct connection failed with status {response.status_code}")
-            except Exception as e:
-                self.logger.error(f"Direct connection test also failed: {str(e)}")
-                
-            error_msg = (
-                "❌ Failed to connect to any BSC node. This could be due to:\n"
-                "1. No internet connection\n"
-                "2. Firewall blocking the connection\n"
-                "3. RPC nodes being temporarily unavailable\n\n"
-                "Troubleshooting steps:\n"
-                "1. Check your internet connection\n"
-                "2. Try using a VPN if you're in a restricted network\n"
-                "3. Try again in a few minutes\n"
-                "4. Set a custom RPC URL in your .env file:\n"
-                "BSC_MAINNET_RPC=your_rpc_url_here"
-            )
-            self.logger.error("All BSC node connection attempts failed")
-            raise ValueError(error_msg)
-            
-        self.logger.info("BSC node connection established successfully")
-
         # Initialize token configuration
         self.token_config = {
             'address': '',
@@ -221,11 +154,11 @@ class TokenTrendingBot:
         else:
             menu_text += "No token connected. Use /connect to add one."
         
-        await update.message.reply_text(menu_text, parse_mode='Markdown')
+        await self.safe_reply_text(update, menu_text, parse_mode='Markdown')
 
     async def connect_token(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start the token connection process."""
-        await update.message.reply_text(
+        await self.safe_reply_text(update, 
             "🔗 Please enter the token details in this format (single line):\n"
             "`<tokenaddress> <chain> <ticker>`\n\n"
             "Example:\n"
@@ -317,100 +250,291 @@ class TokenTrendingBot:
             # Show the updated menu
             await self.menu(update, context)
             
-    def get_web3_instance(self):
-        """Get a working Web3 instance with fallback RPC endpoints."""
-        rpc_endpoints = [
+    def initialize_web3(self):
+        """Initialize Web3 connection with fallback RPC endpoints."""
+        self.logger.info("Initializing Web3 connection...")
+        
+        # Try to get custom RPC from .env, fall back to public endpoints
+        custom_rpc = os.getenv('BSC_MAINNET_RPC')
+        rpc_urls = [
+            custom_rpc,
+            'https://bsc-dataseed.binance.org/',
+            'https://bsc-dataseed1.binance.org/',
+            'https://rpc.ankr.com/bsc',
             'https://bsc-dataseed1.defibit.io',
             'https://bsc-dataseed2.defibit.io',
-            'https://bsc-dataseed1.binance.org',
             'https://bsc-dataseed2.binance.org',
             'https://bsc-dataseed3.binance.org',
             'https://bsc-dataseed4.binance.org',
-            'https://bsc-dataseed.binance.org',
-            'https://bsc-dataseed1.ninicoin.io',
-            'https://bsc-dataseed2.ninicoin.io',
             'https://bsc.nodereal.io',
         ]
         
-        for endpoint in rpc_endpoints:
+        # Filter out None values in case custom_rpc is not set
+        rpc_urls = [url for url in rpc_urls if url]
+        
+        for url in rpc_urls:
             try:
-                provider = HTTPProvider(endpoint, request_kwargs={
-                    'timeout': 10,
-                    'proxies': {
-                        'http': '',
-                        'https': ''
-                    }
-                })
-                w3 = Web3(provider)
-                if w3.is_connected():
-                    return w3
-            except Exception as e:
-                self.logger.warning(f"Failed to connect to {endpoint}: {str(e)}")
-                continue
+                self.logger.info(f"Attempting to connect to: {url}")
                 
-        raise Exception("Could not connect to any BSC RPC endpoint")
+                # Simple provider with basic timeout
+                provider = HTTPProvider(url, request_kwargs={'timeout': 10})
+                web3 = Web3(provider)
+                
+                # Simple connection test
+                block = web3.eth.block_number
+                if isinstance(block, int) and block > 0:
+                    self.web3 = web3
+                    self.logger.info(f"Connected to BSC node. Current block: {block}")
+                    gas_price = web3.eth.gas_price
+                    self.logger.info(f"Current gas price: {web3.from_wei(gas_price, 'gwei'):.2f} Gwei")
+                    return True
+                    
+            except Exception as e:
+                self.logger.warning(f"Failed to connect to {url}: {str(e)}")
+                continue
+        
+        # If we get here, all connection attempts failed
+        error_msg = (
+            "❌ Failed to connect to any BSC node.\n\n"
+            "Please try one of these solutions:\n"
+            "1. Check your internet connection\n"
+            "2. Try using a VPN\n"
+            "3. Set a custom RPC URL in your .env file:\n"
+            "BSC_MAINNET_RPC=your_rpc_url_here"
+        )
+        self.logger.error("All BSC node connection attempts failed")
+        raise ConnectionError(error_msg)
+        
+    def get_web3_instance(self):
+        """Get a working Web3 instance with fallback RPC endpoints."""
+        if self.web3 is None:
+            self.initialize_web3()
+        return self.web3
 
+    def __init__(self):
+        """Initializes the bot, loads configuration, and sets up handlers."""
+        # Load environment variables from project root .env file
+        env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
+        if os.path.exists(env_path):
+            load_dotenv(env_path)
+        else:
+            load_dotenv()  # Fallback to default .env location
+            
+        self.token = os.getenv("TELEGRAM_TOKEN")
+        if not self.token:
+            raise ValueError("TELEGRAM_TOKEN environment variable not found in .env file")
+            
+        self.app = Application.builder().token(self.token).build()
+
+        # This will hold the loaded wallets for the session
+        self.wallets = []
+        self.trading_cycle = None
+        
+        # Configure logging
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        self.logger = logging.getLogger(__name__)
+        
+        # Initialize BNB price cache
+        self._bnb_price_cache = {
+            'price': 300.0,  # Default fallback price
+            'timestamp': 0,
+            'ttl': 300  # 5 minutes in seconds
+        }
+        
+        # Simple and reliable Web3 connection
+        self.logger.info("Initializing Web3 connection...")
+        
+        # Initialize Web3 connection
+        self.web3 = None
+        self.initialize_web3()
+        
+        # Initialize token configuration
+        self.token_config = {
+            'address': '',
+            'chain': '',
+            'ticker': ''
+        }
+        self.load_token_config()
+
+        # Register command handlers
+        self.app.add_handler(CommandHandler("start", self.start))
+        self.app.add_handler(CommandHandler("menu", self.menu))
+        self.app.add_handler(CommandHandler("create_wallet", self.create_wallet))
+        self.app.add_handler(CommandHandler("connect", self.connect_token))
+        self.app.add_handler(CommandHandler("fund_wallet", self.fund_wallet))
+        self.app.add_handler(CommandHandler("check_balance", self.check_balance))
+        self.app.add_handler(CommandHandler("cancel", self.cancel))
+        self.app.add_handler(CommandHandler("start_trend", self.start_trend))
+        self.app.add_handler(CommandHandler("stop_trend", self.stop_trend))
+        
+        # Add message handler for interactive commands
+        self.app.add_handler(MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            self.handle_interactive_messages
+        ))
+        
+        # Initialize central wallet with validation
+        self.central_wallet_address = os.getenv('CENTRAL_WALLET_ADDRESS', '').strip()
+        self.central_wallet_private_key = os.getenv('CENTRAL_WALLET_PRIVATE_KEY', '').strip()
+        
+        if not self.central_wallet_address or not self.central_wallet_private_key:
+            self.logger.warning("Central wallet not fully configured. Wallet funding will not work.")
+        elif self.web3 and self.central_wallet_address:
+            try:
+                # Validate wallet address format
+                if not self.web3.is_address(self.central_wallet_address):
+                    self.logger.error(f"Invalid wallet address format: {self.central_wallet_address}")
+                    self.central_wallet_address = ''
+                else:
+                    # Convert to checksum address
+                    self.central_wallet_address = self.web3.to_checksum_address(self.central_wallet_address)
+                    self.logger.info(f"Central wallet configured: {self.central_wallet_address}")
+            except Exception as e:
+                self.logger.error(f"Error validating central wallet: {str(e)}")
+                self.central_wallet_address = ''
+    async def _fetch_bnb_price_async(self, session, url, parser):
+        """Helper method to fetch BNB price asynchronously"""
+        try:
+            async with session.get(url, timeout=5) as response:
+                response.raise_for_status()
+                data = await response.json()
+                return parser(data)
+        except Exception as e:
+            self.logger.debug(f"Price fetch failed for {url}: {str(e)}")
+            return None
+    
     async def get_bnb_price(self):
-        """Fetch the current BNB price in USD with multiple fallbacks."""
-        # Try Binance first
-        try:
-            url = "https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT"
-            response = requests.get(url, timeout=10, 
-                                 headers={'User-Agent': 'Mozilla/5.0'},
-                                 verify=True)
-            response.raise_for_status()
-            data = response.json()
-            return float(data['price'])
-        except Exception as e:
-            self.logger.warning(f"Failed to fetch BNB price from Binance: {str(e)}")
+        """Fetch the current BNB price in USD with caching and async requests."""
+        current_time = time.time()
+        
+        # Return cached price if still valid
+        if current_time - self._bnb_price_cache['timestamp'] < self._bnb_price_cache['ttl']:
+            return self._bnb_price_cache['price']
             
-        # Fallback to CoinGecko
+        # Define price sources with their URLs and parsers
+        price_sources = [
+            {
+                'url': 'https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT',
+                'parser': lambda d: float(d['price'])
+            },
+            {
+                'url': 'https://api.coingecko.com/api/v3/simple/price?ids=binancecoin&vs_currencies=usd',
+                'parser': lambda d: float(d['binancecoin']['usd'])
+            },
+            {
+                'url': 'https://api.pancakeswap.info/api/v2/tokens/0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c',
+                'parser': lambda d: float(d['data']['price'])
+            }
+        ]
+        
+        # Create a session and fetch all prices in parallel
         try:
-            url = "https://api.coingecko.com/api/v3/simple/price?ids=binancecoin&vs_currencies=usd"
-            response = requests.get(url, timeout=10,
-                                 headers={'User-Agent': 'Mozilla/5.0'},
-                                 verify=True)
-            response.raise_for_status()
-            data = response.json()
-            return float(data['binancecoin']['usd'])
-        except Exception as e:
-            self.logger.warning(f"Failed to fetch BNB price from CoinGecko: {str(e)}")
+            import aiohttp
+            import asyncio
             
-        # Fallback to PancakeSwap API
-        try:
-            url = "https://api.pancakeswap.info/api/v2/tokens/0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"  # WBNB token
-            response = requests.get(url, timeout=10,
-                                 headers={'User-Agent': 'Mozilla/5.0'},
-                                 verify=True)
-            response.raise_for_status()
-            data = response.json()
-            return float(data['data']['price'])
+            async with aiohttp.ClientSession(headers={'User-Agent': 'Mozilla/5.0'}) as session:
+                tasks = [
+                    self._fetch_bnb_price_async(session, source['url'], source['parser'])
+                    for source in price_sources
+                ]
+                
+                # Wait for the first successful response with a timeout of 3 seconds
+                done, pending = await asyncio.wait(
+                    [asyncio.create_task(t) for t in tasks],
+                    return_when=asyncio.FIRST_COMPLETED,
+                    timeout=3.0
+                )
+                
+                # Get the first successful result
+                for task in done:
+                    result = await task
+                    if result is not None:
+                        # Update cache
+                        self._bnb_price_cache = {
+                            'price': result,
+                            'timestamp': current_time,
+                            'ttl': 300  # 5 minutes
+                        }
+                        return result
+                        
         except Exception as e:
-            self.logger.warning(f"Failed to fetch BNB price from PancakeSwap: {str(e)}")
-            
-        # Final fallback to hardcoded price
-        self.logger.warning("Using hardcoded BNB price as fallback")
-        return 300.0  # Conservative estimate if all APIs fail
+            self.logger.warning(f"Async price fetch failed: {str(e)}")
+        
+        # Return cached price if available, otherwise fallback
+        return self._bnb_price_cache['price']
 
     async def fund_wallet(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start the wallet funding process with dynamic BNB/USD calculation."""
-        if not hasattr(self, 'central_wallet_address') or not self.central_wallet_address:
-            await update.message.reply_text(
-                "❌ Central wallet not configured. "
-                "Please set CENTRAL_WALLET_ADDRESS and CENTRAL_WALLET_PRIVATE_KEY in your .env file."
+        # Reload environment variables to get the latest values
+        env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
+        if os.path.exists(env_path):
+            load_dotenv(env_path, override=True)
+            
+        # Update central wallet info from environment
+        self.central_wallet_address = os.getenv('CENTRAL_WALLET_ADDRESS', '').strip()
+        self.central_wallet_private_key = os.getenv('CENTRAL_WALLET_PRIVATE_KEY', '').strip()
+        
+        # Validate the wallet address
+        if not self.central_wallet_address or not self.central_wallet_private_key:
+            await self.safe_reply_text(
+                update,
+                "❌ Central wallet not fully configured.\n"
+                "Please set both CENTRAL_WALLET_ADDRESS and CENTRAL_WALLET_PRIVATE_KEY in your .env file."
             )
             return
             
-        # Get current BNB price
         try:
-            bnb_price = await self.get_bnb_price()
-            if not bnb_price:
-                raise ValueError("Could not fetch BNB price")
+            # Convert to checksum address
+            self.central_wallet_address = self.web3.to_checksum_address(self.central_wallet_address)
+        except Exception as e:
+            await self.safe_reply_text(
+                update,
+                f"❌ Invalid wallet address in configuration: {self.central_wallet_address}\n"
+                f"Error: {str(e)}"
+            )
+            return
+            
+        # Log the wallet being used
+        self.logger.info(f"Using central wallet: {self.central_wallet_address}")
+        
+        # Start a loading message with the wallet address
+        loading_message = await self.safe_reply_text(
+            update,
+            f"🔍 Fetching data for wallet:\n`{self.central_wallet_address}`",
+            parse_mode='Markdown'
+        )
+            
+        try:
+            # Get BNB price and wallet balance in parallel
+            bnb_price_task = asyncio.create_task(self.get_bnb_price())
+            
+            # Get wallet balance with timeout
+            try:
+                # Use web3's async provider if available, otherwise run in executor
+                if hasattr(self.web3.provider, 'make_request'):
+                    balance_wei = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: self.web3.eth.get_balance(self.central_wallet_address)
+                    )
+                else:
+                    balance_wei = self.web3.eth.get_balance(self.central_wallet_address)
+                    
+                # Wait for price with timeout
+                try:
+                    bnb_price = await asyncio.wait_for(bnb_price_task, timeout=3.0)
+                except asyncio.TimeoutError:
+                    bnb_price = self._bnb_price_cache['price']  # Use cached price if timeout
+                    
+                balance_bnb = self.web3.from_wei(balance_wei, 'ether')
+                balance_usd = float(balance_bnb) * bnb_price
                 
-            # Get central wallet balance
-            balance_wei = self.web3.eth.get_balance(self.central_wallet_address)
-            balance_bnb = self.web3.from_wei(balance_wei, 'ether')
-            balance_usd = float(balance_bnb) * bnb_price
+            except Exception as e:
+                self.logger.error(f"Error getting wallet balance: {str(e)}")
+                await loading_message.edit_text("❌ Error fetching wallet data. Please try again.")
+                return
             
             # Calculate how many wallets we can fund
             min_required_usd = 2.00  # $1 per wallet + $1 reserve
@@ -422,26 +546,44 @@ class TokenTrendingBot:
                 bsc_scan_link = f"https://bscscan.com/address/{self.central_wallet_address}"
                 
                 # Format the message with proper escaping for MarkdownV2
-                # Escape all special MarkdownV2 characters in dynamic content
-                min_required_escaped = str(min_required_usd).replace('.', '\.')
-                balance_usd_escaped = str(round(balance_usd, 2)).replace('.', '\.')
-                balance_bnb_escaped = str(round(balance_bnb, 6)).replace('.', '\.')
-                bnb_price_escaped = str(round(bnb_price, 4)).replace('.', '\.')
-                needed_usd_escaped = str(round(needed_usd, 2)).replace('.', '\.')
+                def escape_markdown(text):
+                    if text is None:
+                        return ""
+                    text = str(text)
+                    # Escape Markdown special characters
+                    escape_chars = r'_*[]()~`>#+-=|{}.!:'
+                    return ''.join(f'\\{char}' if char in escape_chars else char for char in text)
                 
+                # Format numbers with proper escaping
+                min_required_escaped = escape_markdown(f"{min_required_usd:.2f}")
+                balance_usd_escaped = escape_markdown(f"{balance_usd:.2f}")
+                balance_bnb_escaped = escape_markdown(f"{balance_bnb:.6f}")
+                bnb_price_escaped = escape_markdown(f"{bnb_price:.4f}")
+                needed_usd_escaped = escape_markdown(f"{needed_usd:.2f}")
+                
+                # Build message with proper MarkdownV2 escaping
+                # For code blocks in MarkdownV2, we need to use backticks properly
                 message = (
-                    f"❌ *Need at least ${min_required_escaped} to fund 1 wallet*\n"
-                    f"• *Current*: ${balance_usd_escaped} \\(`{balance_bnb_escaped} BNB\\)\n"
-                    f"• *BNB Price*: \${bnb_price_escaped}\n\n"
-                    f"Send at least *\${needed_usd_escaped}* more to\:\n"
-                    f"```\n{self.central_wallet_address}\n```\n"
-                    f"[View on BSCScan]({bsc_scan_link})\n\n"
-                    "After sending, use /check\\_balance to verify the transaction\."
+                    "❌ *Need at least ${} to fund 1 wallet*\n"
+                    "• *Current*: ${} \(`{} BNB\)\n"
+                    "• *BNB Price*: ${}\n\n"
+                    "Send at least *${}* more to:\n"
+                    "```\n{}\n```\n"
+                    "[View on BSCScan]({})\n\n"
+                    "After sending, use /check\_balance to verify the transaction"
+                ).format(
+                    min_required_escaped,
+                    balance_usd_escaped,
+                    balance_bnb_escaped,
+                    bnb_price_escaped,
+                    needed_usd_escaped,
+                    self.central_wallet_address,
+                    bsc_scan_link
                 )
                 
-                # Send the message with MarkdownV2 parse mode
+                # Edit the loading message with the result
                 try:
-                    await update.message.reply_text(
+                    await loading_message.edit_text(
                         message,
                         parse_mode='MarkdownV2',
                         disable_web_page_preview=True
@@ -458,7 +600,7 @@ class TokenTrendingBot:
                         f"View on BSCScan: {bsc_scan_link}\n\n"
                         "After sending, use /check_balance to verify the transaction."
                     )
-                    await update.message.reply_text(plain_message)
+                    await loading_message.edit_text(plain_message)
                 return
                 
             # Calculate how many wallets we can fund
@@ -828,46 +970,117 @@ class TokenTrendingBot:
         # Update the menu to show the new status
         await self.menu(update, context)
 
+    async def safe_reply_text(self, update: Update, text: str, parse_mode=None, max_retries=3, initial_delay=1):
+        """Safely send a reply with retry logic for timeouts and other transient errors."""
+        last_exception = None
+        delay = initial_delay
+        
+        for attempt in range(max_retries):
+            try:
+                return await update.message.reply_text(
+                    text,
+                    parse_mode=parse_mode,
+                    disable_web_page_preview=True,
+                    read_timeout=30,
+                    write_timeout=30,
+                    connect_timeout=30,
+                    pool_timeout=30
+                )
+            except Exception as e:
+                last_exception = e
+                self.logger.warning(f"Attempt {attempt + 1} failed: {str(e)}")
+                if attempt < max_retries - 1:  # Don't sleep on the last attempt
+                    await asyncio.sleep(delay)
+                    delay *= 2  # Exponential backoff
+        
+        error_msg = f"❌ Failed to send message after {max_retries} attempts: {str(last_exception)}"
+        self.logger.error(error_msg)
+        # Try one last time without handling the error
+        return await update.message.reply_text(
+            "⚠️ " + error_msg[:3800],  # Truncate to avoid message too long
+            disable_web_page_preview=True
+        )
+
     async def create_wallet(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Reads pre-generated wallets from wallets.json and displays them."""
-        await update.message.reply_text("🔎 Checking for pre-generated wallets...")
+        # Check if token details are connected
+        if not all(key in self.token_config for key in ['address', 'chain', 'ticker']):
+            await self.safe_reply_text(update, "❌ Please connect token details first using /connect command.")
+            return
+        
+        await self.safe_reply_text(update, "🔎 Checking for pre-generated wallets...")
+        
         try:
             # Construct the absolute path to wallets.json relative to this script
             bot_dir = os.path.dirname(os.path.abspath(__file__))
             wallets_file_path = os.path.join(bot_dir, '..', 'hardhat-scripts', 'wallets.json')
+            self.logger.info(f"Looking for wallets at: {wallets_file_path}")
 
             if not os.path.exists(wallets_file_path):
-                await update.message.reply_text(
-                    "❌ [wallets.json](cci:7://file:///c:/Users/User/bot1/hardhat-scripts/wallets.json:0:0-0:0) not found.\\n\\n"
-                    "Please run the wallet generation script manually in your terminal first."
+                error_msg = (
+                    "❌ `wallets.json` not found.\n\n"
+                    "Please run the wallet generation script manually in your terminal first.\n"
+                    "Expected location: `hardhat-scripts/wallets.json`"
                 )
+                await self.safe_reply_text(update, error_msg, parse_mode='Markdown')
                 return
 
-            with open(wallets_file_path, 'r') as f:
-                wallets = json.load(f)
+            # Read the file with explicit encoding
+            with open(wallets_file_path, 'r', encoding='utf-8') as f:
+                try:
+                    wallets = json.load(f)
+                except json.JSONDecodeError as e:
+                    error_msg = (
+                        "❌ Error reading `wallets.json`. The file is corrupted or empty.\n\n"
+                        f"Error: {str(e)}\n\n"
+                        "Please run the wallet generation script again."
+                    )
+                    await self.safe_reply_text(update, error_msg, parse_mode='Markdown')
+                    return
+            
+            if not isinstance(wallets, list):
+                error_msg = "❌ Invalid format in `wallets.json`. Expected a list of wallet objects."
+                await self.safe_reply_text(update, error_msg, parse_mode='Markdown')
+                return
             
             self.wallets = wallets
-            addresses = [w.get('address') for w in wallets if w.get('address')]
+            addresses = [w.get('address') for w in wallets if w and isinstance(w, dict) and w.get('address')]
 
             if not addresses:
-                await update.message.reply_text("⚠️ [wallets.json](cci:7://file:///c:/Users/User/bot1/hardhat-scripts/wallets.json:0:0-0:0) is empty or malformed. Please run the generation script again.")
+                error_msg = "⚠️ `wallets.json` is empty or malformed. Please run the generation script again."
+                await self.safe_reply_text(update, error_msg, parse_mode='Markdown')
                 return
 
             response = f"✅ Found {len(addresses)} pre-generated wallets.\n\n"
             response += "\n".join(addresses)
             
-            # Split the message into chunks of 4000 characters to avoid hitting Telegram's message length limit
-            chunk_size = 4000
-            for i in range(0, len(response), chunk_size):
-                chunk = response[i:i + chunk_size]
-                await update.message.reply_text(chunk)
+            # Split the message into chunks to avoid hitting Telegram's message length limit
+            chunk_size = 3000  # Conservative chunk size to account for markdown characters
+            chunks = [response[i:i + chunk_size] for i in range(0, len(response), chunk_size)]
+            
+            for i, chunk in enumerate(chunks):
+                try:
+                    await self.safe_reply_text(
+                        update, 
+                        chunk,
+                        parse_mode='Markdown' if i == 0 else None  # Only parse markdown for first message
+                    )
+                    # Small delay between chunks to avoid rate limiting
+                    if i < len(chunks) - 1:
+                        await asyncio.sleep(1)
+                except Exception as e:
+                    self.logger.error(f"Error sending chunk {i+1}/{len(chunks)}: {str(e)}")
+                    continue
 
-        except json.JSONDecodeError:
-            await update.message.reply_text("❌ Error reading [wallets.json](cci:7://file:///c:/Users/User/bot1/hardhat-scripts/wallets.json:0:0-0:0). The file is corrupted or empty. Please run the generation script again.")
         except Exception as e:
             tb_str = traceback.format_exc()
-            logging.error(f"Critical error in create_wallet: {tb_str}")
-            await update.message.reply_text(f"An unexpected critical error occurred. Please check the logs.")
+            self.logger.error(f"Critical error in create_wallet: {tb_str}")
+            error_msg = (
+                "❌ An unexpected error occurred while processing wallets.\n\n"
+                f"Error: {str(e)}\n\n"
+                "Please check the logs for more details."
+            )
+            await self.safe_reply_text(update, error_msg)
 
     def run(self):
         """Starts the bot."""
