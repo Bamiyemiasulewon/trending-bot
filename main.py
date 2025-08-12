@@ -6,15 +6,14 @@ import asyncio
 import time
 import requests
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.constants import ChatAction
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.request import HTTPXRequest
 from dotenv import load_dotenv
-import nest_asyncio
 from web3 import Web3, HTTPProvider
 from trading_cycle import TradingCycle
 
-# Apply nest_asyncio to allow the Telegram bot's async event loop
-# to coexist with other async operations.
-nest_asyncio.apply()
+ 
 
 class TokenTrendingBot:
     def __init__(self):
@@ -30,6 +29,7 @@ class TokenTrendingBot:
         if not self.token:
             raise ValueError("TELEGRAM_TOKEN environment variable not found in .env file")
             
+        # Initialize the application with the bot token
         self.app = Application.builder().token(self.token).build()
 
         # This will hold the loaded wallets for the session
@@ -79,6 +79,9 @@ class TokenTrendingBot:
             self.handle_interactive_messages
         ))
         
+        # Global error handler to prevent crashes on transient network issues
+        self.app.add_error_handler(self.handle_application_error)
+        
         # Initialize central wallet with validation
         self.central_wallet_address = os.getenv('CENTRAL_WALLET_ADDRESS', '').strip()
         self.central_wallet_private_key = os.getenv('CENTRAL_WALLET_PRIVATE_KEY', '').strip()
@@ -101,7 +104,8 @@ class TokenTrendingBot:
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Sends a welcome message when the /start command is issued."""
-        await update.message.reply_text(
+        await self.safe_reply_text(
+            update,
             "Welcome to the DexScreener Trending Bot!\n"
             "Use /menu to see available commands."
         )
@@ -186,7 +190,8 @@ class TokenTrendingBot:
             # Parse the input: tokenaddress chain ticker
             parts = user_input.split()
             if len(parts) < 3:
-                await update.message.reply_text(
+                await self.safe_reply_text(
+                    update,
                     "❌ Invalid format. Please enter: `<tokenaddress> <chain> <ticker>`\n"
                     "Example: `0x123...abc BNB TOKEN`",
                     parse_mode='Markdown'
@@ -199,7 +204,8 @@ class TokenTrendingBot:
             
             # Validate token address
             if not token_address.startswith('0x') or len(token_address) != 42:
-                await update.message.reply_text(
+                await self.safe_reply_text(
+                    update,
                     "❌ Invalid token address. Must start with 0x and be 42 characters long."
                     "\n\nPlease try again with format: `<tokenaddress> <chain> <ticker>`",
                     parse_mode='Markdown'
@@ -208,7 +214,8 @@ class TokenTrendingBot:
                 
             # Validate chain
             if chain not in ['BNB', 'ETH', 'SOL']:
-                await update.message.reply_text(
+                await self.safe_reply_text(
+                    update,
                     "❌ Invalid chain. Please use BNB, ETH, or SOL."
                     "\n\nPlease try again with format: `<tokenaddress> <chain> <ticker>`",
                     parse_mode='Markdown'
@@ -240,7 +247,8 @@ class TokenTrendingBot:
             response = f"{token_address}    {chain}    {ticker}"
             
             # Send the response in the requested format
-            await update.message.reply_text(
+            await self.safe_reply_text(
+                update,
                 f"✅ Token Connected Successfully!\n\n"
                 f"{response}\n\n"
                 "You can now use /start_trend to begin the trading cycle.",
@@ -251,58 +259,76 @@ class TokenTrendingBot:
             await self.menu(update, context)
             
     def initialize_web3(self):
-        """Initialize Web3 connection with fallback RPC endpoints."""
+        """Initialize Web3 connection with endpoint rotation, timeouts, and retry backoff."""
         self.logger.info("Initializing Web3 connection...")
-        
-        # Try to get custom RPC from .env, fall back to public endpoints
-        custom_rpc = os.getenv('BSC_MAINNET_RPC')
+
+        # Preferred/custom endpoint from environment
+        custom_rpc = (os.getenv('BSC_MAINNET_RPC') or '').strip() or None
+
+        # Curated list of reliable public endpoints (ordered by general reliability)
         rpc_urls = [
             custom_rpc,
+            'https://bsc.publicnode.com',
+            'https://rpc.ankr.com/bsc',
+            'https://1rpc.io/bnb',
+            'https://bsc-dataseed1.bnbchain.org',
             'https://bsc-dataseed.binance.org/',
             'https://bsc-dataseed1.binance.org/',
-            'https://rpc.ankr.com/bsc',
-            'https://bsc-dataseed1.defibit.io',
-            'https://bsc-dataseed2.defibit.io',
             'https://bsc-dataseed2.binance.org',
             'https://bsc-dataseed3.binance.org',
             'https://bsc-dataseed4.binance.org',
-            'https://bsc.nodereal.io',
+            'https://bsc-dataseed1.defibit.io',
+            'https://bsc-dataseed2.defibit.io',
+            'https://endpoints.omniatech.io/v1/bsc/mainnet/public',
         ]
-        
-        # Filter out None values in case custom_rpc is not set
-        rpc_urls = [url for url in rpc_urls if url]
-        
-        for url in rpc_urls:
-            try:
-                self.logger.info(f"Attempting to connect to: {url}")
-                
-                # Simple provider with basic timeout
-                provider = HTTPProvider(url, request_kwargs={'timeout': 10})
-                web3 = Web3(provider)
-                
-                # Simple connection test
-                block = web3.eth.block_number
-                if isinstance(block, int) and block > 0:
+        # Remove Nones/empties and dedupe while preserving order
+        seen = set()
+        rpc_urls = [u for u in rpc_urls if u and not (u in seen or seen.add(u))]
+
+        # Retry across rounds with exponential backoff
+        max_rounds = 3
+        base_timeout = 10  # seconds per request
+        for round_idx in range(1, max_rounds + 1):
+            self.logger.info(f"Web3 connect attempt round {round_idx}/{max_rounds}...")
+            for url in rpc_urls:
+                try:
+                    self.logger.info(f"Attempting to connect to: {url}")
+                    provider = HTTPProvider(url, request_kwargs={'timeout': base_timeout})
+                    web3 = Web3(provider)
+
+                    # Validate connection by reading latest block and gas price
+                    block = web3.eth.block_number
+                    if not isinstance(block, int) or block <= 0:
+                        raise RuntimeError("Invalid block number returned")
+
+                    gas_price = web3.eth.gas_price  # will raise if provider isn't healthy
+
+                    # Success path
                     self.web3 = web3
-                    self.logger.info(f"Connected to BSC node. Current block: {block}")
-                    gas_price = web3.eth.gas_price
-                    self.logger.info(f"Current gas price: {web3.from_wei(gas_price, 'gwei'):.2f} Gwei")
+                    self.logger.info(
+                        f"Connected to BSC node {url}. Block: {block}, Gas: {web3.from_wei(gas_price, 'gwei'):.2f} Gwei"
+                    )
                     return True
-                    
-            except Exception as e:
-                self.logger.warning(f"Failed to connect to {url}: {str(e)}")
-                continue
-        
-        # If we get here, all connection attempts failed
+
+                except Exception as e:
+                    self.logger.warning(f"Connection failed for {url}: {e}")
+                    continue
+
+            # Backoff before next round if none succeeded
+            if round_idx < max_rounds:
+                backoff = min(30, 2 ** round_idx * 2)  # 4s, 8s; cap 30s
+                self.logger.info(f"All endpoints failed in round {round_idx}. Backing off for {backoff}s before retry...")
+                time.sleep(backoff)
+
+        # If we get here, all attempts in all rounds have failed
         error_msg = (
-            "❌ Failed to connect to any BSC node.\n\n"
-            "Please try one of these solutions:\n"
-            "1. Check your internet connection\n"
-            "2. Try using a VPN\n"
-            "3. Set a custom RPC URL in your .env file:\n"
-            "BSC_MAINNET_RPC=your_rpc_url_here"
+            "❌ Failed to connect to any BSC node after multiple attempts.\n\n"
+            "Suggestions:\n"
+            "1) Verify internet/DNS connectivity (try switching DNS to 1.1.1.1/8.8.8.8).\n"
+            "2) Try a VPN or different network.\n"
+            "3) Set a working custom RPC in .env: BSC_MAINNET_RPC=your_rpc_url_here"
         )
-        self.logger.error("All BSC node connection attempts failed")
+        self.logger.error("All BSC node connection attempts failed after retries")
         raise ConnectionError(error_msg)
         
     def get_web3_instance(self):
@@ -324,8 +350,16 @@ class TokenTrendingBot:
         if not self.token:
             raise ValueError("TELEGRAM_TOKEN environment variable not found in .env file")
             
-        self.app = Application.builder().token(self.token).build()
-
+        # Create the application with tuned HTTP timeouts to reduce startup flakiness
+        request = HTTPXRequest(
+            connect_timeout=20,
+            read_timeout=60,
+            write_timeout=60,
+            pool_timeout=30,
+        )
+        self.app = Application.builder().token(self.token).request(request).build()
+        self.bot = self.app.bot
+            
         # This will hold the loaded wallets for the session
         self.wallets = []
         self.trading_cycle = None
@@ -395,6 +429,7 @@ class TokenTrendingBot:
             except Exception as e:
                 self.logger.error(f"Error validating central wallet: {str(e)}")
                 self.central_wallet_address = ''
+
     async def _fetch_bnb_price_async(self, session, url, parser):
         """Helper method to fetch BNB price asynchronously"""
         try:
@@ -565,12 +600,12 @@ class TokenTrendingBot:
                 # For code blocks in MarkdownV2, we need to use backticks properly
                 message = (
                     "❌ *Need at least ${} to fund 1 wallet*\n"
-                    "• *Current*: ${} \(`{} BNB\)\n"
+                    "• *Current*: ${} (`{} BNB`)\n"
                     "• *BNB Price*: ${}\n\n"
                     "Send at least *${}* more to:\n"
                     "```\n{}\n```\n"
                     "[View on BSCScan]({})\n\n"
-                    "After sending, use /check\_balance to verify the transaction"
+                    "After sending, use /check_balance to verify the transaction"
                 ).format(
                     min_required_escaped,
                     balance_usd_escaped,
@@ -603,9 +638,12 @@ class TokenTrendingBot:
                     await loading_message.edit_text(plain_message)
                 return
                 
-            # Calculate how many wallets we can fund
+            # Calculate how many wallets we can fund (retain $1, $1 per wallet)
+            if not self.wallets:
+                await self.safe_reply_text(update, "❌ No wallets loaded. Run /create_wallet first.")
+                return
             max_wallets = int((balance_usd - 1.00) / 1.00)  # Leave $1 for gas
-            max_wallets = min(max_wallets, 34)  # Max 34 wallets
+            max_wallets = max(0, min(max_wallets, len(self.wallets), 34))  # Cap by available wallets and 34
             
             bnb_per_wallet = 1.00 / bnb_price  # $1 worth of BNB per wallet
             total_bnb = bnb_per_wallet * max_wallets
@@ -620,7 +658,9 @@ class TokenTrendingBot:
             context.user_data['funding_details'] = funding_details
             context.user_data['awaiting_funding_confirmation'] = True
             
-            await update.message.reply_text(
+            # Replace with safe sender
+            await self.safe_reply_text(
+                update,
                 f"💰 *Funding Plan*\n"
                 f"• Wallets to fund: {max_wallets}\n"
                 f"• BNB per wallet: {bnb_per_wallet:.6f} (${1.00:.2f})\n"
@@ -632,16 +672,36 @@ class TokenTrendingBot:
             
         except Exception as e:
             self.logger.error(f"Error in fund_wallet: {str(e)}", exc_info=True)
-            await update.message.reply_text(
-                "❌ An error occurred while checking balances. Please try again later."
-            )
+            await self.safe_reply_text(update, "❌ An error occurred while checking balances. Please try again later.")
+
+    async def handle_interactive_messages(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle all interactive text messages.
+        
+        Currently routes funding confirmation when a funding plan is proposed
+        by /fund_wallet or /check_balance (Option A flow).
+        """
+        try:
+            # Token connection flow
+            if context.user_data.get('awaiting_token_info'):
+                return await self.handle_token_info(update, context)
+
+            # Funding confirmation flow
+            if context.user_data.get('awaiting_funding_confirmation'):
+                return await self.handle_funding_confirmation(update, context)
+
+            # Default fallback
+            await self.safe_reply_text(update, "I didn't understand that. Use /menu to see available commands.")
+        except Exception as e:
+            self.logger.error(f"Error in handle_interactive_messages: {str(e)}", exc_info=True)
+            await self.safe_reply_text(update, "❌ An unexpected error occurred while processing your message.")
 
     async def handle_funding_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle funding confirmation from user."""
         user_input = update.message.text.strip().lower()
         
         if user_input != 'confirm':
-            await update.message.reply_text(
+            await self.safe_reply_text(
+                update,
                 "Please type `confirm` to proceed with funding, "
                 "or /cancel to abort the funding process.",
                 parse_mode='Markdown'
@@ -651,7 +711,7 @@ class TokenTrendingBot:
         # Get funding details
         funding_details = context.user_data.get('funding_details', {})
         if not funding_details:
-            await update.message.reply_text("❌ Error: Missing funding details. Please try /fund_wallet again.")
+            await self.safe_reply_text(update, "❌ Error: Missing funding details. Please try /fund_wallet again.")
             return
             
         # Clear the funding confirmation flag
@@ -663,11 +723,11 @@ class TokenTrendingBot:
     async def distribute_funds(self, update: Update, context: ContextTypes.DEFAULT_TYPE, funding_details: dict):
         """Distribute funds from central wallet to trading wallets based on available balance."""
         if not self.wallets:
-            await update.message.reply_text("❌ No wallets found to fund.")
+            await self.safe_reply_text(update, "❌ No wallets found to fund.")
             return
             
         if not self.central_wallet_private_key or not self.central_wallet_address:
-            await update.message.reply_text("❌ Central wallet not configured.")
+            await self.safe_reply_text(update, "❌ Central wallet not configured.")
             return
             
         bnb_per_wallet = funding_details['bnb_per_wallet']
@@ -683,22 +743,22 @@ class TokenTrendingBot:
             if balance_bnb < min_balance_needed:
                 adjusted_wallets = int((balance_bnb - (1.0 / funding_details['bnb_price'])) / bnb_per_wallet)
                 if adjusted_wallets < 1:
-                    await update.message.reply_text(
+                    await self.safe_reply_text(
+                        update,
                         f"❌ Insufficient balance. Need at least ${1 + (1.0 / funding_details['bnb_price']):.2f} "
                         f"worth of BNB to fund 1 wallet.\n\n"
-                        f"Send more BNB to:\n`{self.central_wallet_address}`"
+                        f"Send more BNB to:\n`{self.central_wallet_address}`",
+                        parse_mode='Markdown'
                     )
                     return
                 
                 max_wallets = adjusted_wallets
                 funding_details['max_wallets'] = max_wallets
                 
-                await update.message.reply_text(
-                    f"⚠️ Balance decreased. Will now fund {max_wallets} wallets."
-                )
+                await self.safe_reply_text(update, f"⚠️ Balance decreased. Will now fund {max_wallets} wallets.", parse_mode='Markdown')
                 
             # Start funding process
-            status_msg = await update.message.reply_text("🔄 Starting to fund wallets...")
+            status_msg = await self.safe_reply_text(update, "🔄 Starting to fund wallets...")
             success_count = 0
             funded_wallets = []
             
@@ -783,20 +843,23 @@ class TokenTrendingBot:
             
         except Exception as e:
             self.logger.error(f"Error in distribute_funds: {str(e)}\n{traceback.format_exc()}")
-            await update.message.reply_text(
-                f"❌ Error during funding process: {str(e)}\n\n"
-                "Please check the logs and try again."
-            )
+            await self.safe_reply_text(update, f"❌ Error during funding process: {str(e)}\n\nPlease check the logs and try again.")
     
     async def check_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Check the balance of the central wallet and all trading wallets."""
+        """Check the balance of the central wallet."""
         if not hasattr(self, 'central_wallet_address') or not self.central_wallet_address:
-            await update.message.reply_text("❌ Central wallet not configured.")
+            await self.safe_reply_text(update, "❌ Central wallet not configured.")
             return
             
         try:
-            # Show typing action
-            await update.message.reply_chat_action('typing')
+            # Show typing action (PTB v20+)
+            try:
+                await context.bot.send_chat_action(
+                    chat_id=update.effective_chat.id,
+                    action=ChatAction.TYPING
+                )
+            except Exception as _:
+                pass
             
             # Get BNB price
             bnb_price = await self.get_bnb_price()
@@ -808,59 +871,25 @@ class TokenTrendingBot:
             balance_bnb = self.web3.from_wei(balance_wei, 'ether')
             balance_usd = float(balance_bnb) * bnb_price
             
-            # Format the response
-            response = (
-                "💰 *Wallet Balances*\n\n"
-                f"*Central Wallet* (`{self.central_wallet_address[:6]}...{self.central_wallet_address[-4:]}`):\n"
-                f"• {balance_bnb:.6f} BNB (${balance_usd:.2f})\n"
+            # Format response for only the central wallet (classic Markdown, cleaner spacing)
+            addr_short = f"{self.central_wallet_address[:6]}...{self.central_wallet_address[-4:]}"
+            response_text = (
+                "💰 *Wallet Balance*\n\n"
+                "*Central Wallet*\n"
+                f"• Address: `{self._escape_markdown(addr_short)}`\n"
+                f"• Balance: `{balance_bnb:.6f} BNB`\n"
+                f"• USD: `${balance_usd:.2f}`\n"
+                f"• BscScan: https://bscscan.com/address/{self.central_wallet_address}\n"
             )
-            
-            # Add BSCScan link for central wallet
-            bsc_scan_link = f"https://bscscan.com/address/{self.central_wallet_address}"
-            response += f"• [View on BSCScan]({bsc_scan_link})\n\n"
-            
-            # Check trading wallets if they exist
-            if hasattr(self, 'wallets') and self.wallets:
-                response += "*Trading Wallets:*\n"
-                total_balance_bnb = 0
-                
-                for i, wallet in enumerate(self.wallets, 1):
-                    try:
-                        wallet_balance_wei = self.web3.eth.get_balance(wallet['address'])
-                        wallet_balance_bnb = self.web3.from_wei(wallet_balance_wei, 'ether')
-                        wallet_balance_usd = float(wallet_balance_bnb) * bnb_price
-                        total_balance_bnb += float(wallet_balance_bnb)
-                        
-                        wallet_link = f"https://bscscan.com/address/{wallet['address']}"
-                        response += (
-                            f"{i}. `{wallet['address'][:6]}...{wallet['address'][-4:]}`\n"
-                            f"   • Balance: {wallet_balance_bnb:.6f} BNB (${wallet_balance_usd:.2f})\n"
-                            f"   • [View on BSCScan]({wallet_link})\n\n"
-                        )
-                    except Exception as e:
-                        self.logger.error(f"Error checking wallet {wallet['address']}: {str(e)}")
-                        response += f"{i}. `{wallet['address'][:6]}...`: Error checking balance\n\n"
-                
-                # Add total
-                total_balance_usd = total_balance_bnb * bnb_price
-                response += (
-                    f"*Total Trading Wallets Balance:*\n"
-                    f"• {total_balance_bnb:.6f} BNB (${total_balance_usd:.2f})\n"
-                )
-            
-            # Add refresh button
-            response += "\n🔄 Use /check_balance to refresh"
-            
-            await update.message.reply_text(
-                response,
-                parse_mode='Markdown',
-                disable_web_page_preview=True
+            # Use the safe_reply_text method which already handles disable_web_page_preview
+            await self.safe_reply_text(
+                update=update,
+                text=response_text,
+                parse_mode='Markdown'
             )
         except Exception as e:
             self.logger.error(f"Error in check_balance: {str(e)}")
-            await update.message.reply_text(
-                "❌ An error occurred while checking balances. Please try again later."
-            )
+            await self.safe_reply_text(update, "❌ An error occurred while checking balances. Please try again later.")
     
     async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Cancel any ongoing operation."""
@@ -871,7 +900,7 @@ class TokenTrendingBot:
             for key in ['awaiting_token_info', 'token_address', 'chain']:
                 if key in context.user_data:
                     del context.user_data[key]
-            await update.message.reply_text("❌ Token connection cancelled. Use /connect to start over.")
+            await self.safe_reply_text(update, "❌ Token connection cancelled. Use /connect to start over.")
             cancelled = True
             
         # Cancel funding process if in progress
@@ -879,11 +908,11 @@ class TokenTrendingBot:
             for key in ['awaiting_funding_confirmation', 'funding_amount', 'funding_gas_price']:
                 if key in context.user_data:
                     del context.user_data[key]
-            await update.message.reply_text("❌ Wallet funding cancelled. Use /fund_wallet to start over.")
+            await self.safe_reply_text(update, "❌ Wallet funding cancelled. Use /fund_wallet to start over.")
             cancelled = True
             
         if not cancelled:
-            await update.message.reply_text("❌ No operation to cancel.")
+            await self.safe_reply_text(update, "❌ No operation to cancel.")
             
         # Save the token configuration
         self.token_config = {
@@ -910,7 +939,8 @@ class TokenTrendingBot:
             with open(env_path, 'w') as f:
                 f.writelines(lines)
         
-        await update.message.reply_text(
+        await self.safe_reply_text(
+            update,
             f"✅ *Token Connected Successfully!*\n\n"
             f"• *Address:* `{token_address}`\n"
             f"• *Chain:* {chain.upper()}\n"
@@ -929,15 +959,11 @@ class TokenTrendingBot:
     async def start_trend(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start the trending trading cycle"""
         if not self.wallets:
-            await update.message.reply_text(
-                "❌ No wallets loaded. Please use /create_wallet first."
-            )
+            await self.safe_reply_text(update, "❌ No wallets loaded. Please use /create_wallet first.")
             return
             
         if not self.token_config.get('address'):
-            await update.message.reply_text(
-                "❌ No token connected. Please use /connect first."
-            )
+            await self.safe_reply_text(update, "❌ No token connected. Please use /connect first.")
             return
             
         # Initialize trading cycle if not already done
@@ -953,7 +979,7 @@ class TokenTrendingBot:
         
         # Start the trading cycle
         result = await self.trading_cycle.start()
-        await update.message.reply_text(result)
+        await self.safe_reply_text(update, result)
         
         # Update the menu to show the new status
         await self.menu(update, context)
@@ -961,45 +987,136 @@ class TokenTrendingBot:
     async def stop_trend(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Stop the trending trading cycle"""
         if not hasattr(self, 'trading_cycle') or not self.trading_cycle:
-            await update.message.reply_text("❌ No active trading cycle to stop.")
+            await self.safe_reply_text(update, "❌ No active trading cycle to stop.")
             return
             
+        # Stop the trading cycle
         result = await self.trading_cycle.stop()
-        await update.message.reply_text(result)
+        await self.safe_reply_text(update, result)
         
         # Update the menu to show the new status
         await self.menu(update, context)
+        
+    def _escape_markdown(self, text: str) -> str:
+        """Escape a minimal set of Markdown characters to avoid Telegram parse errors.
+        This targets classic 'Markdown' (not MarkdownV2) issues like parentheses and a few common symbols.
+        """
+        if not text:
+            return text
+        # Escape backslashes first
+        text = text.replace('\\', '\\\\')
+        # Minimal escapes for classic Markdown
+        replacements = {
+            '(': '\\(',
+            ')': '\\)',
+            '*': '\\*',
+            '_': '\\_',
+            '[': '\\[',
+            ']': '\\]',
+            '`': '\\`',
+        }
+        for k, v in replacements.items():
+            text = text.replace(k, v)
+        return text
 
-    async def safe_reply_text(self, update: Update, text: str, parse_mode=None, max_retries=3, initial_delay=1):
-        """Safely send a reply with retry logic for timeouts and other transient errors."""
-        last_exception = None
+    def _split_message(self, text: str, max_len: int = 4000) -> list:
+        """Split a message into chunks under max_len, preferring line or word boundaries."""
+        if len(text) <= max_len:
+            return [text]
+        chunks = []
+        start = 0
+        while start < len(text):
+            end = min(len(text), start + max_len)
+            # Prefer to break at a newline
+            split_at = text.rfind('\n', start, end)
+            if split_at == -1 or split_at <= start + max_len * 0.6:
+                # Try space if no good newline
+                split_at = text.rfind(' ', start, end)
+            if split_at == -1 or split_at <= start:
+                split_at = end
+            chunk = text[start:split_at]
+            chunks.append(chunk)
+            start = split_at
+        return [c for c in chunks if c]
+
+    async def safe_reply_text(self, update: Update, text: str, parse_mode=None, max_retries=3, initial_delay=1, **kwargs):
+        """Safely send a reply with retry logic for timeouts and other transient errors.
+        
+        Args:
+            update: The update object from the Telegram bot
+            text: The message text to send
+            parse_mode: The parse mode for the message (e.g., 'Markdown', 'HTML')
+            max_retries: Maximum number of retry attempts
+            initial_delay: Initial delay between retries in seconds
+            **kwargs: Additional arguments to pass to reply_text
+        """
         delay = initial_delay
-        
-        for attempt in range(max_retries):
-            try:
-                return await update.message.reply_text(
-                    text,
-                    parse_mode=parse_mode,
-                    disable_web_page_preview=True,
-                    read_timeout=30,
-                    write_timeout=30,
-                    connect_timeout=30,
-                    pool_timeout=30
-                )
-            except Exception as e:
-                last_exception = e
-                self.logger.warning(f"Attempt {attempt + 1} failed: {str(e)}")
-                if attempt < max_retries - 1:  # Don't sleep on the last attempt
-                    await asyncio.sleep(delay)
-                    delay *= 2  # Exponential backoff
-        
-        error_msg = f"❌ Failed to send message after {max_retries} attempts: {str(last_exception)}"
-        self.logger.error(error_msg)
-        # Try one last time without handling the error
-        return await update.message.reply_text(
-            "⚠️ " + error_msg[:3800],  # Truncate to avoid message too long
-            disable_web_page_preview=True
-        )
+        last_exception = None
+
+        # Set default kwargs if not provided
+        kwargs.setdefault('disable_web_page_preview', True)
+        kwargs.setdefault('read_timeout', 30)
+        kwargs.setdefault('write_timeout', 30)
+        kwargs.setdefault('connect_timeout', 30)
+        kwargs.setdefault('pool_timeout', 30)
+
+        # Pre-escape Markdown if requested to avoid parse errors
+        effective_text = text
+        if parse_mode:
+            kwargs['parse_mode'] = parse_mode
+            if parse_mode == 'Markdown':
+                effective_text = self._escape_markdown(effective_text)
+
+        # Decide chunk size conservatively
+        max_len = 3500 if kwargs.get('parse_mode') else 4000
+        chunks = self._split_message(effective_text, max_len=max_len)
+
+        last_result = None
+        for idx, chunk in enumerate(chunks):
+            delay = initial_delay
+            for attempt in range(max_retries):
+                try:
+                    last_result = await update.message.reply_text(chunk, **kwargs)
+                    # Small pause between chunks to avoid rate limits
+                    if idx < len(chunks) - 1:
+                        await asyncio.sleep(0.6)
+                    break
+                except Exception as e:
+                    last_exception = e
+                    self.logger.warning(f"Attempt {attempt + 1} failed: {str(e)}")
+
+                    # If Telegram rejects Markdown entities, fall back to plain text once per chunk
+                    msg = str(e).lower()
+                    if ("can't parse entities" in msg or 'parse entities' in msg or 'bad request: markdown' in msg) and kwargs.get('parse_mode'):
+                        self.logger.info("Falling back to plain text due to Markdown parse error")
+                        kwargs.pop('parse_mode', None)
+                        # Recompute chunks for plain text on first failure
+                        remaining_text = '\n'.join([chunk] + chunks[idx + 1:])
+                        chunks = self._split_message(remaining_text, max_len=4000)
+                        # restart sending from current index with plain text
+                        break
+
+                    if attempt < max_retries - 1:  # Don't sleep on the last attempt
+                        await asyncio.sleep(delay)
+                        delay *= 2  # Exponential backoff
+            else:
+                # Exhausted retries for this chunk; abort
+                error_msg = f"❌ Failed to send message chunk {idx + 1}/{len(chunks)} after {max_retries} attempts: {str(last_exception)}"
+                self.logger.error(error_msg)
+                # Attempt to notify with minimal text
+                try:
+                    return await update.message.reply_text(
+                        "⚠️ " + error_msg[:3800],
+                        disable_web_page_preview=True
+                    )
+                except Exception:
+                    raise
+            # If we broke out of inner loop due to markdown fallback, restart outer loop
+            if not kwargs.get('parse_mode') and idx < len(chunks) and chunk not in chunks:
+                # chunks were recomputed; restart loop to send from the beginning of new chunks
+                return await self.safe_reply_text(update, text, parse_mode=None, max_retries=max_retries, initial_delay=initial_delay, **kwargs)
+
+        return last_result
 
     async def create_wallet(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Reads pre-generated wallets from wallets.json and displays them."""
@@ -1007,7 +1124,7 @@ class TokenTrendingBot:
         if not all(key in self.token_config for key in ['address', 'chain', 'ticker']):
             await self.safe_reply_text(update, "❌ Please connect token details first using /connect command.")
             return
-        
+            
         await self.safe_reply_text(update, "🔎 Checking for pre-generated wallets...")
         
         try:
@@ -1060,11 +1177,8 @@ class TokenTrendingBot:
             
             for i, chunk in enumerate(chunks):
                 try:
-                    await self.safe_reply_text(
-                        update, 
-                        chunk,
-                        parse_mode='Markdown' if i == 0 else None  # Only parse markdown for first message
-                    )
+                    # Send chunks without Markdown parse mode to avoid entity errors on large messages
+                    await self.safe_reply_text(update, chunk)
                     # Small delay between chunks to avoid rate limiting
                     if i < len(chunks) - 1:
                         await asyncio.sleep(1)
@@ -1089,7 +1203,16 @@ class TokenTrendingBot:
             level=logging.INFO
         )
         logging.info("Bot starting...")
-        self.app.run_polling()
+        # Drop pending updates and ensure clean polling startup
+        self.app.run_polling(drop_pending_updates=True)
+
+    async def handle_application_error(self, update: object, context: ContextTypes.DEFAULT_TYPE):
+        """Global error handler to log and suppress non-fatal errors."""
+        try:
+            self.logger.error("Application error", exc_info=context.error)
+        except Exception:
+            # Ensure we never raise from the error handler
+            pass
 
 if __name__ == '__main__':
     bot = TokenTrendingBot()
