@@ -211,23 +211,23 @@ class TokenTrendingBot:
             chain = parts[1].upper()
             ticker = parts[2].upper()
             
-            # Validate token address
+            # Validate token address (BNB Chain style: 0x-prefixed, 42 chars)
             if not token_address.startswith('0x') or len(token_address) != 42:
                 await self.safe_reply_text(
                     update,
-                    "❌ Invalid token address. Must start with 0x and be 42 characters long."
-                    "\n\nPlease try again with format: `<tokenaddress> <chain> <ticker>`",
-                    parse_mode='Markdown'
+                    "❌ Invalid token address. Must start with 0x and be 42 characters long.\n\n"
+                    "Please try again with format: \n<code>&lt;tokenaddress&gt; &lt;chain&gt; &lt;ticker&gt;</code>",
+                    parse_mode='HTML'
                 )
                 return
                 
-            # Validate chain
-            if chain not in ['BNB', 'ETH', 'SOL']:
+            # Validate chain (BNB only as requested)
+            if chain != 'BNB':
                 await self.safe_reply_text(
                     update,
-                    "❌ Invalid chain. Please use BNB, ETH, or SOL."
-                    "\n\nPlease try again with format: `<tokenaddress> <chain> <ticker>`",
-                    parse_mode='Markdown'
+                    "❌ Invalid chain. Please use <b>BNB</b>.\n\n"
+                    "Please try again with format: \n<code>&lt;tokenaddress&gt; BNB &lt;ticker&gt;</code>",
+                    parse_mode='HTML'
                 )
                 return
                 
@@ -238,6 +238,8 @@ class TokenTrendingBot:
                 'ticker': ticker
             }
             self.save_token_config()
+            # Persist primary token address for cycle checks
+            self.token_address = token_address
             
             # Clear the state
             del context.user_data['awaiting_token_info']
@@ -668,15 +670,17 @@ class TokenTrendingBot:
             balance_bnb = float(self.web3.from_wei(balance_wei, 'ether'))
             
             # Adjust if balance changed since plan was made
-            min_balance_needed = funding_details['total_bnb'] + (1.0 / funding_details['bnb_price'])
+            gas_reserve_usd = float(funding_details.get('gas_reserve_usd', 1.0))
+            min_balance_needed = funding_details['total_bnb'] + (gas_reserve_usd / funding_details['bnb_price'])
             if balance_bnb < min_balance_needed:
-                adjusted_wallets = int((balance_bnb - (1.0 / funding_details['bnb_price'])) / bnb_per_wallet)
+                adjusted_wallets = int((balance_bnb - (gas_reserve_usd / funding_details['bnb_price'])) / bnb_per_wallet)
                 if adjusted_wallets < 1:
+                    min_needed_usd = float(funding_details.get('gas_reserve_usd', 1.0)) + float(funding_details.get('usd_per_wallet', 1.0))
                     await self.safe_reply_text(
                         update,
                         (
                             "❌ <b>Insufficient balance</b>\n\n"
-                            f"Need at least <b>${1 + (1.0 / funding_details['bnb_price']):.2f}</b> worth of BNB to fund 1 wallet.\n\n"
+                            f"Need at least <b>${min_needed_usd:.2f}</b> to fund 1 wallet after gas reserve.\n\n"
                             "Send more BNB to:\n"
                             f"<pre>{self.central_wallet_address}</pre>"
                         ),
@@ -778,7 +782,7 @@ class TokenTrendingBot:
                 status_msg,
                 f"✅ Funding complete!\n\n"
                 f"• Successfully funded: {success_count}/{max_wallets} wallets\n"
-                f"• Amount per wallet: {bnb_per_wallet:.6f} BNB (≈$1.00)\n"
+                f"• Amount per wallet: {bnb_per_wallet:.6f} BNB (≈${float(funding_details.get('usd_per_wallet', 1.0)):.2f})\n"
                 f"• Total distributed: {success_count * bnb_per_wallet:.6f} BNB\n"
                 f"• Remaining balance: {final_balance:.6f} BNB\n\n"
                 f"These wallets are now ready for trading with /start_trend"
@@ -786,10 +790,11 @@ class TokenTrendingBot:
             
             # Also send a final confirmation message in chat
             try:
+                usd_per_wallet = float(funding_details.get('usd_per_wallet', 1.0))
                 summary_text = (
                     "✅ <b>Funding Completed</b>\n\n"
                     f"• Funded wallets: <b>{success_count}/{max_wallets}</b>\n"
-                    f"• Per wallet: <code>{bnb_per_wallet:.6f} BNB</code> (≈$1.00)\n"
+                    f"• Per wallet: <code>{bnb_per_wallet:.6f} BNB</code> (≈${usd_per_wallet:.2f})\n"
                     f"• Total sent: <code>{success_count * bnb_per_wallet:.6f} BNB</code>\n"
                     f"• Remaining: <code>{final_balance:.6f} BNB</code>\n"
                 )
@@ -1028,13 +1033,32 @@ class TokenTrendingBot:
             balance_bnb = float(self.web3.from_wei(balance_wei, 'ether'))
             balance_usd = balance_bnb * bnb_price
 
-            if balance_usd < 2.0:
-                needed_usd = 2.0 - balance_usd
+            # Read configurable funding parameters (clamped to exactly $1.00 as policy)
+            def _parse_float(env_key: str, default: float) -> float:
+                try:
+                    return float(os.getenv(env_key, str(default)))
+                except Exception:
+                    return default
+
+            usd_per_wallet = _parse_float('FUND_USD_PER_WALLET', 1.0)
+            gas_reserve_usd = _parse_float('GAS_RESERVE_USD', 1.0)
+
+            # Clamp out-of-range or unexpected values to exactly 1.0 (per requirement)
+            if usd_per_wallet != 1.0:
+                self.logger.warning(f"FUND_USD_PER_WALLET={usd_per_wallet} overridden to 1.0 per policy")
+                usd_per_wallet = 1.0
+            if gas_reserve_usd != 1.0:
+                self.logger.warning(f"GAS_RESERVE_USD={gas_reserve_usd} overridden to 1.0 per policy")
+                gas_reserve_usd = 1.0
+
+            min_required_usd = gas_reserve_usd + usd_per_wallet
+            if balance_usd < min_required_usd:
+                needed_usd = min_required_usd - balance_usd
                 needed_bnb = needed_usd / bnb_price if bnb_price else 0.0
                 bsc_scan_link = f"https://bscscan.com/address/{self.central_wallet_address}"
 
                 msg = (
-                    "❌ <b>Need at least $2.00 to start funding</b>\n\n"
+                    f"❌ <b>Need at least ${min_required_usd:.2f} to start funding</b>\n\n"
                     f"• <b>Current</b>: ${balance_usd:.2f} (<code>{balance_bnb:.6f} BNB</code>)\n"
                     f"• <b>BNB Price</b>: ${bnb_price:.4f}\n\n"
                     f"Send at least <b>${needed_usd:.2f}</b> (≈<code>{needed_bnb:.6f} BNB</code>) more to:\n\n"
@@ -1045,20 +1069,22 @@ class TokenTrendingBot:
                 await self.safe_reply_text(update, msg, parse_mode='HTML')
                 return
 
-            # Determine funding plan: leave $1 for gas, $1 per wallet
-            max_wallets_possible = int((balance_usd - 1.00) / 1.00)
+            # Determine funding plan based on configured USD per wallet and gas reserve
+            max_wallets_possible = int((balance_usd - gas_reserve_usd) / usd_per_wallet)
             max_wallets = max(0, min(max_wallets_possible, len(self.wallets), 34))
             if max_wallets <= 0:
                 await self.safe_reply_text(update, "⚠️ Not enough balance after reserving gas to fund any wallet.")
                 return
 
-            bnb_per_wallet = 1.00 / bnb_price
+            bnb_per_wallet = usd_per_wallet / bnb_price
             total_bnb = bnb_per_wallet * max_wallets
             funding_details = {
                 'max_wallets': max_wallets,
                 'bnb_per_wallet': bnb_per_wallet,
                 'total_bnb': total_bnb,
-                'bnb_price': bnb_price
+                'bnb_price': bnb_price,
+                'usd_per_wallet': usd_per_wallet,
+                'gas_reserve_usd': gas_reserve_usd
             }
 
             # Trigger the standard funding routine which posts progress and completion
@@ -1141,28 +1167,40 @@ class TokenTrendingBot:
             await self.safe_reply_text(update, "ℹ️ No operation to cancel.")
 
     async def start_trend(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Start trading/trending using funded wallets. Placeholder implementation.
-        Ensures the command exists and provides clear guidance.
-        """
+        """Start trading/trending after pre-flight checks."""
         try:
+            # Pre-flight: require valid connected token every time
+            token_addr = getattr(self, 'token_address', None) or (self.token_config.get('address') if hasattr(self, 'token_config') else None)
+            if not token_addr or not str(token_addr).startswith('0x') or len(str(token_addr)) != 42:
+                await self.safe_reply_text(update, "❌ No valid token connected. Please use /connect to set token details before starting the cycle.")
+                return
+
+            # Pre-flight: require funded wallets
             funded = getattr(self, 'funded_wallets', []) or []
             if not funded:
-                await self.safe_reply_text(
-                    update,
-                    "❌ No funded wallets available. Use /start_funding first.",
-                )
+                await self.safe_reply_text(update, "❌ No funded wallets available. Use /start_funding first.")
                 return
-            # Provide a simple acknowledgement for now
-            preview = ", ".join([f"{w[:6]}...{w[-4:]}" for w in funded[:5]])
-            more = "" if len(funded) <= 5 else f" and {len(funded) - 5} more"
-            await self.safe_reply_text(
-                update,
-                (
-                    "🚀 Trading will start using funded wallets.\n"
-                    f"Wallets: {preview}{more}.\n\n"
-                    "(Note: detailed trading routine not implemented in this build.)"
-                ),
-            )
+
+            # Ensure trading_cycle exists and token is in sync
+            if not hasattr(self, 'trading_cycle') or not self.trading_cycle:
+                self.trading_cycle = TradingCycle(wallet_manager=self, web3=self.web3, token_address=token_addr)
+            else:
+                self.trading_cycle.token_address = token_addr
+
+            # Map funded wallets into the trading cycle structure if needed
+            # Expecting wallets as list of dicts with 'address' and 'private_key'
+            try:
+                self.trading_cycle.wallets = [
+                    { 'address': w, 'private_key': self.wallet_private_keys[w] } if isinstance(w, str) else w
+                    for w in funded
+                ]
+            except Exception:
+                # If structure already correct, keep as-is
+                self.trading_cycle.wallets = funded
+
+            # Start the cycle
+            msg = await self.trading_cycle.start()
+            await self.safe_reply_text(update, msg)
         except Exception as e:
             self.logger.error(f"Error in start_trend: {str(e)}", exc_info=True)
             await self.safe_reply_text(update, "❌ Failed to start trend. Please try again later.")
