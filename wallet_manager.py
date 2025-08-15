@@ -160,25 +160,113 @@ class WalletManager:
             
         return len(self.wallets[chain])
         
-    async def check_wallet_balances(self, chain: str, provider_url: str):
-        """Check and update balances for all wallets on a chain"""
+    async def check_wallet_balances(self, chain: str, provider_url: str = None, min_balance: float = 0.00085) -> dict:
+        """Check and update balances for all wallets on a chain with improved error handling and retries.
+        
+        Args:
+            chain: The blockchain network (ETH, BNB, SOL)
+            provider_url: Optional RPC URL. If not provided, uses the instance's Web3 provider.
+            min_balance: Minimum balance threshold to consider a wallet as 'funded'
+            
+        Returns:
+            dict: {
+                'total_wallets': int,
+                'funded_wallets': int,
+                'total_balance': float,
+                'wallets': List[dict]  # List of wallet details with balances
+            }
+        """
         chain = chain.upper()
         if chain not in self.wallets:
             raise ValueError(f"Unsupported chain: {chain}")
             
-        if chain in ['ETH', 'BNB']:
-            w3 = Web3(Web3.HTTPProvider(provider_url))
-            for wallet in self.wallets[chain]:
-                try:
-                    balance = w3.eth.get_balance(wallet['address'])
-                    wallet['balance'] = w3.from_wei(balance, 'ether')
-                except Exception as e:
-                    logging.error(f"Failed to check balance for {wallet['address']}: {str(e)}")
-        else:  # SOL
-            # Implement Solana balance check
-            pass
+        result = {
+            'total_wallets': len(self.wallets[chain]),
+            'funded_wallets': 0,
+            'total_balance': 0.0,
+            'wallets': []
+        }
+        
+        try:
+            if chain in ['ETH', 'BNB']:
+                w3 = Web3(Web3.HTTPProvider(provider_url)) if provider_url else self.w3
+                if not w3.is_connected():
+                    raise ConnectionError("Failed to connect to Web3 provider")
+                    
+                for wallet in self.wallets[chain]:
+                    wallet_info = wallet.copy()
+                    try:
+                        # Get balance with retry logic
+                        balance_wei = await self._get_balance_with_retry(w3, wallet['address'])
+                        balance = float(w3.from_wei(balance_wei, 'ether'))
+                        
+                        # Update wallet info
+                        wallet_info['balance'] = balance
+                        wallet_info['is_funded'] = balance >= min_balance
+                        
+                        # Update result counters
+                        if wallet_info['is_funded']:
+                            result['funded_wallets'] += 1
+                            result['total_balance'] += balance
+                            
+                    except Exception as e:
+                        self.logger.error(f"Error checking balance for {wallet['address']}: {str(e)}")
+                        wallet_info['error'] = str(e)
+                        wallet_info['is_funded'] = False
+                    
+                    result['wallets'].append(wallet_info)
+                    
+            elif chain == 'SOL':
+                # TODO: Implement Solana balance checking
+                pass
+                
+            # Save updated balances
+            self.save_wallets()
             
-        self.save_wallets()
+        except Exception as e:
+            self.logger.error(f"Error in check_wallet_balances: {str(e)}")
+            raise
+            
+        return result
+        
+    async def _get_balance_with_retry(self, w3, address: str, max_retries: int = 3, delay: float = 1.0) -> int:
+        """Helper method to get wallet balance with retry logic"""
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                # Add a small delay between retries
+                if attempt > 0:
+                    await asyncio.sleep(delay * attempt)
+                return w3.eth.get_balance(address)
+            except Exception as e:
+                last_error = e
+                self.logger.warning(f"Attempt {attempt + 1} failed for {address}: {str(e)}")
+        
+        self.logger.error(f"Failed to get balance for {address} after {max_retries} attempts: {str(last_error)}")
+        raise last_error
+        
+    def get_funded_wallets(self, chain: str, min_balance: float = 0.00085) -> List[Dict]:
+        """Get a list of wallets with balance >= min_balance"""
+        chain = chain.upper()
+        if chain not in self.wallets:
+            raise ValueError(f"Unsupported chain: {chain}")
+            
+        return [
+            w for w in self.wallets[chain] 
+            if isinstance(w.get('balance'), (int, float)) and w['balance'] >= min_balance
+        ]
+        
+    def get_total_distributed(self, chain: str) -> float:
+        """Get total distributed amount for a chain"""
+        chain = chain.upper()
+        if chain not in self.wallets:
+            raise ValueError(f"Unsupported chain: {chain}")
+            
+        return sum(
+            w.get('distributed', 0) 
+            for w in self.wallets[chain] 
+            if isinstance(w.get('distributed'), (int, float))
+        )
         
     def rotate_wallets(self, chain: str, used_addresses: List[str]):
         """Mark wallets as used and rotate to ensure even distribution"""

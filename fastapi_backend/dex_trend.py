@@ -71,7 +71,7 @@ class DexTrendManager:
                 'nonce': w3.eth.get_transaction_count(acct.address)
             })
             signed_tx = w3.eth.account.sign_transaction(tx, private_key)
-            tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
             self.log_manager.log_activity(acct.address, tx_hash.hex(), time.time(), buy_amount, "buy")
         except Exception as e:
             print(f"Buy failed: {e}")

@@ -4,6 +4,7 @@ import logging
 import traceback
 import asyncio
 import time
+import uuid
 import requests
 from telegram import Update
 from telegram.constants import ChatAction
@@ -11,7 +12,22 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from telegram.request import HTTPXRequest
 from dotenv import load_dotenv
 from web3 import Web3, HTTPProvider
-from trading_cycle import TradingCycle
+
+try:
+    from trading_cycle import TradingCycle
+except ImportError:
+    # Fallback for package installation
+    from .trading_cycle import TradingCycle
+
+try:
+    from sol_trading_cycle import SolanaTradingCycle
+except ImportError:
+    try:
+        # Fallback for package installation
+        from .sol_trading_cycle import SolanaTradingCycle
+    except ImportError:
+        SolanaTradingCycle = None
+from solana.rpc.api import Client as SolClient
 
  
 
@@ -67,6 +83,67 @@ class TokenTrendingBot:
             self.total_distributed_bnb = float(self.token_config.get('total_distributed_bnb', 0.0) or 0.0)
         except Exception:
             self.total_distributed_bnb = 0.0
+        # Reflect connected chain if persisted
+        self.connected_chain = (self.token_config.get('chain') or '').upper() or None
+        
+        # Load wallets if we have a connected chain
+        if self.connected_chain:
+            self.logger.info(f"Loading wallets for chain: {self.connected_chain}")
+            try:
+                if self.connected_chain == 'BNB':
+                    # Look for wallets in the project root's hardhat-scripts directory
+                    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                    wallets_file_path = os.path.join(project_root, 'hardhat-scripts', 'wallets.json')
+                    self.logger.info(f"Looking for BNB wallets at: {wallets_file_path}")
+                    # Fall back to bsc_wallets.json if it exists and wallets.json doesn't
+                    if not os.path.exists(wallets_file_path):
+                        self.logger.info(f"Primary wallet file not found, checking for fallback...")
+                        fallback_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bsc_wallets.json')
+                        self.logger.info(f"Checking fallback path: {fallback_path}")
+                        if os.path.exists(fallback_path):
+                            wallets_file_path = fallback_path
+                            self.logger.info(f"Using fallback wallet file: {wallets_file_path}")
+                elif self.connected_chain == 'ETH':
+                    wallets_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'eth_wallet.json')
+                    self.logger.info(f"Looking for ETH wallets at: {wallets_file_path}")
+                elif self.connected_chain == 'SOL':
+                    wallets_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sol_wallet.json')
+                    self.logger.info(f"Looking for SOL wallets at: {wallets_file_path}")
+                else:
+                    self.logger.warning(f"Unsupported chain for wallet loading: {self.connected_chain}")
+                    return
+                
+                wallets_file_path = os.path.normpath(wallets_file_path)
+                self.logger.info(f"Final wallet file path: {wallets_file_path}")
+                
+                if os.path.exists(wallets_file_path):
+                    self.logger.info(f"Wallet file exists, attempting to load...")
+                    with open(wallets_file_path, 'r', encoding='utf-8') as f:
+                        wallets = json.load(f)
+                        self.logger.info(f"Successfully loaded wallet data, type: {type(wallets)}")
+                        if isinstance(wallets, list):
+                            # Normalize wallet objects to have address (private keys ignored for output)
+                            normalized = []
+                            for i, w in enumerate(wallets, 1):
+                                if not isinstance(w, dict):
+                                    self.logger.warning(f"Skipping non-dict wallet at index {i-1}")
+                                    continue
+                                addr = w.get('address') or w.get('addr')
+                                if addr:
+                                    normalized.append({"address": addr})
+                                else:
+                                    self.logger.warning(f"Wallet at index {i-1} has no valid address: {w}")
+                            
+                            self.wallets = normalized
+                            self.logger.info(f"Successfully loaded {len(self.wallets)} wallets from {wallets_file_path}")
+                            if self.wallets:
+                                self.logger.info(f"First wallet address: {self.wallets[0].get('address')}")
+                        else:
+                            self.logger.error(f"Wallet data is not a list: {type(wallets)}")
+                else:
+                    self.logger.error(f"Wallet file does not exist: {wallets_file_path}")
+            except Exception as e:
+                self.logger.error(f"Error loading wallets on startup: {str(e)}", exc_info=True)
 
         # Register command handlers
         self.app.add_handler(CommandHandler("start", self.start))
@@ -77,6 +154,7 @@ class TokenTrendingBot:
         self.app.add_handler(CommandHandler("check_balance", self.check_balance))
         self.app.add_handler(CommandHandler("wallet_status", self.wallet_status))
         self.app.add_handler(CommandHandler("start_funding", self.start_funding))
+        self.app.add_handler(CommandHandler("refresh_funded", self.refresh_funded))
         self.app.add_handler(CommandHandler("cancel", self.cancel))
         self.app.add_handler(CommandHandler("start_trend", self.start_trend))
         self.app.add_handler(CommandHandler("stop_trend", self.stop_trend))
@@ -90,32 +168,161 @@ class TokenTrendingBot:
         # Global error handler to prevent crashes on transient network issues
         self.app.add_error_handler(self.handle_application_error)
         
-        # Initialize central wallet with validation
-        self.central_wallet_address = os.getenv('CENTRAL_WALLET_ADDRESS', '').strip()
-        self.central_wallet_private_key = os.getenv('CENTRAL_WALLET_PRIVATE_KEY', '').strip()
+        # Initialize central wallets (BNB/ETH/SOL) from environment
+        self.central_wallets = {
+            'BNB': {
+                'address': os.getenv('BSC_CENTRAL_WALLET', '').strip(),
+                'private_key': os.getenv('BSC_CENTRAL_WALLET_KEY', '').strip(),
+            },
+            'ETH': {
+                'address': os.getenv('ETH_CENTRAL_WALLET', '').strip(),
+                'private_key': os.getenv('ETH_CENTRAL_WALLET_KEY', '').strip(),
+            },
+            'SOL': {
+                'address': os.getenv('SOL_CENTRAL_WALLET', '').strip(),
+                'private_key': os.getenv('SOL_CENTRAL_WALLET_KEY', '').strip(),
+            },
+        }
+        # Backward compatibility with single-chain BNB setup
+        legacy_addr = os.getenv('CENTRAL_WALLET_ADDRESS', '').strip()
+        legacy_key = os.getenv('CENTRAL_WALLET_PRIVATE_KEY', '').strip()
+        if legacy_addr and not self.central_wallets['BNB']['address']:
+            self.central_wallets['BNB']['address'] = legacy_addr
+        if legacy_key and not self.central_wallets['BNB']['private_key']:
+            self.central_wallets['BNB']['private_key'] = legacy_key
+
+        # Validate EVM central wallet addresses when possible
+        try:
+            if self.web3 and self.central_wallets['BNB']['address']:
+                if self.web3.is_address(self.central_wallets['BNB']['address']):
+                    self.central_wallets['BNB']['address'] = self.web3.to_checksum_address(self.central_wallets['BNB']['address'])
         
-        if not self.central_wallet_address or not self.central_wallet_private_key:
-            self.logger.warning("Central wallet not fully configured. Wallet funding will not work.")
-        elif self.web3 and self.central_wallet_address:
+            # For ETH, reuse web3 if already connected to BSC; checksum still valid
+            if self.web3 and self.central_wallets['ETH']['address'] and self.web3.is_address(self.central_wallets['ETH']['address']):
+                self.central_wallets['ETH']['address'] = self.web3.to_checksum_address(self.central_wallets['ETH']['address'])
+        except Exception as e:
+            self.logger.warning(f"Central wallet validation warning: {e}")
+
+        # Convenience properties for existing BNB-only flows
+        self.central_wallet_address = self.central_wallets.get('BNB', {}).get('address', '')
+        self.central_wallet_private_key = self.central_wallets.get('BNB', {}).get('private_key', '')
+
+    def get_central_wallet(self, chain: str):
+        """Return central wallet dict for chain: keys address/private_key.
+        Lazily initializes from environment if not already present to avoid AttributeError
+        when older __init__ path is executed.
+        """
+        if not hasattr(self, 'central_wallets') or not isinstance(getattr(self, 'central_wallets'), dict):
+            # Initialize from environment
+            self.central_wallets = {
+                'BNB': {
+                    'address': os.getenv('BSC_CENTRAL_WALLET', '').strip(),
+                    'private_key': os.getenv('BSC_CENTRAL_WALLET_KEY', '').strip(),
+                },
+                'ETH': {
+                    'address': os.getenv('ETH_CENTRAL_WALLET', '').strip(),
+                    'private_key': os.getenv('ETH_CENTRAL_WALLET_KEY', '').strip(),
+                },
+                'SOL': {
+                    'address': os.getenv('SOL_CENTRAL_WALLET', '').strip(),
+                    'private_key': os.getenv('SOL_CENTRAL_WALLET_KEY', '').strip(),
+                },
+            }
+            # Backward compatibility legacy keys for BNB
+            legacy_addr = os.getenv('CENTRAL_WALLET_ADDRESS', '').strip()
+            legacy_key = os.getenv('CENTRAL_WALLET_PRIVATE_KEY', '').strip()
+            if legacy_addr and not self.central_wallets['BNB']['address']:
+                self.central_wallets['BNB']['address'] = legacy_addr
+            if legacy_key and not self.central_wallets['BNB']['private_key']:
+                self.central_wallets['BNB']['private_key'] = legacy_key
+        return self.central_wallets.get((chain or '').upper(), {})
+
+    def moralis_trending(self, chain: str):
+        """Fetch trending tokens via Moralis for given chain: BNB(bsc), ETH(eth), SOL(solana)."""
+        chain_map = {'BNB': 'bsc', 'ETH': 'eth', 'SOL': 'solana'}
+        chain_id = chain_map.get((chain or '').upper())
+        if not chain_id:
+            raise ValueError(f"Unsupported chain: {chain}")
+        api_key = os.getenv('MORALIS_API_KEY', '').strip()
+        if not api_key:
+            raise RuntimeError("MORALIS_API_KEY not set in environment")
+        url = f"https://deep-index.moralis.io/api/v2.2/market/trending/tokens?chain={chain_id}"
+        headers = {"X-API-Key": api_key}
+        resp = requests.get(url, headers=headers, timeout=20)
+        resp.raise_for_status()
+        return resp.json()
+
+    def detect_chain_from_address(self, token_address: str) -> str | None:
+        """Heuristically detect chain from address.
+        - If starts with 0x and len 42: try BNB then ETH via eth_getCode; pick the one with non-empty code; if both empty, return None.
+        - Else if looks like base58 (no 0x, length 32-48): SOL.
+        Returns 'BNB' | 'ETH' | 'SOL' | None
+        """
+        if not token_address:
+            return None
+        addr = token_address.strip()
+        # SOL pattern
+        if not addr.startswith('0x') and 32 <= len(addr) <= 48:
+            return 'SOL'
+        # EVM pattern
+        if addr.startswith('0x') and len(addr) == 42:
+            # Try BNB first
             try:
-                # Validate wallet address format
-                if not self.web3.is_address(self.central_wallet_address):
-                    self.logger.error(f"Invalid wallet address format: {self.central_wallet_address}")
-                    self.central_wallet_address = ''
-                else:
-                    # Convert to checksum address
-                    self.central_wallet_address = self.web3.to_checksum_address(self.central_wallet_address)
-                    self.logger.info(f"Central wallet configured: {self.central_wallet_address}")
-            except Exception as e:
-                self.logger.error(f"Error validating central wallet: {str(e)}")
-                self.central_wallet_address = ''
+                w3_bnb = self.get_web3_for_chain('BNB')
+                if w3_bnb.is_address(addr):
+                    code = w3_bnb.eth.get_code(w3_bnb.to_checksum_address(addr))
+                    if code and len(code) > 2:
+                        return 'BNB'
+            except Exception:
+                pass
+            # Then ETH
+            try:
+                w3_eth = self.get_web3_for_chain('ETH')
+                if w3_eth.is_address(addr):
+                    code = w3_eth.eth.get_code(w3_eth.to_checksum_address(addr))
+                    if code and len(code) > 2:
+                        return 'ETH'
+            except Exception:
+                pass
+            # Ambiguous EVM: neither BNB nor ETH has code at this address -> require explicit chain
+            return None
+        return None
+
+    def get_web3_for_chain(self, chain: str) -> Web3:
+        """Return a Web3 connected to the given EVM chain (ETH or BNB)."""
+        chain = (chain or '').upper()
+        if chain == 'ETH':
+            eth_rpc = (os.getenv('ETH_MAINNET_RPC') or os.getenv('INFURA_ETH_MAINNET') or '').strip()
+            if not eth_rpc:
+                # Common Infura pattern; user should set ETH_MAINNET_RPC instead
+                project = os.getenv('INFURA_PROJECT_ID', '').strip()
+                if project:
+                    eth_rpc = f"https://mainnet.infura.io/v3/{project}"
+            if not eth_rpc:
+                raise RuntimeError('No ETH_MAINNET_RPC configured')
+            return Web3(HTTPProvider(eth_rpc, request_kwargs={'timeout': 10}))
+        if chain == 'BNB':
+            bsc_rpc = (os.getenv('BSC_MAINNET_RPC') or '').strip() or 'https://bsc.publicnode.com'
+            return Web3(HTTPProvider(bsc_rpc, request_kwargs={'timeout': 10}))
+        raise ValueError(f'Unsupported EVM chain: {chain}')
+
+    def get_solana_client(self) -> SolClient:
+        url = (os.getenv('SOLANA_MAINNET_RPC') or 'https://api.mainnet-beta.solana.com').strip()
+        return SolClient(url)
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Sends a welcome message when the /start command is issued."""
+        user = update.effective_user
+        name = (getattr(user, 'first_name', None) or getattr(user, 'full_name', None) or 'there').strip()
         await self.safe_reply_text(
             update,
-            "Welcome to the DexScreener Trending Bot!\n"
-            "Use /menu to see available commands."
+            (
+                f"👋 Hey {name}!\n\n"
+                "🤖 <b>Welcome to TrendingBot</b>\n"
+                "Manage wallets, connect tokens, and start trending cycles.\n\n"
+                "Use <b>/menu</b> to see available commands."
+            ),
+            parse_mode='HTML'
         )
 
     def load_token_config(self):
@@ -123,19 +330,57 @@ class TokenTrendingBot:
         try:
             config_path = os.path.join(os.path.dirname(__file__), 'token_config.json')
             if os.path.exists(config_path):
+                self.logger.info(f"Loading token config from {config_path}")
                 with open(config_path, 'r') as f:
-                    self.token_config = json.load(f)
+                    loaded_config = json.load(f)
+                
+                # Update token_config with loaded values, preserving any defaults
+                self.token_config.update(loaded_config)
+                
+                # Ensure funded_wallets is initialized and loaded
+                if not hasattr(self, 'funded_wallets'):
+                    self.funded_wallets = []
+                
+                # Load funded_wallets from config if it exists
+                if 'funded_wallets' in loaded_config and isinstance(loaded_config['funded_wallets'], list):
+                    self.funded_wallets = loaded_config['funded_wallets']
+                    self.logger.info(f"Loaded {len(self.funded_wallets)} funded wallets from config")
+                
+                # Load total_distributed_bnb from config if it exists
+                if 'total_distributed_bnb' in loaded_config:
+                    try:
+                        self.total_distributed_bnb = float(loaded_config['total_distributed_bnb'] or 0.0)
+                        self.logger.info(f"Loaded total_distributed_bnb: {self.total_distributed_bnb}")
+                    except (ValueError, TypeError) as e:
+                        self.logger.warning(f"Invalid total_distributed_bnb value, resetting to 0: {e}")
+                        self.total_distributed_bnb = 0.0
+                
+                # Save the updated config to ensure all fields are present
+                self.save_token_config()
+                
         except Exception as e:
-            logging.error(f"Error loading token config: {e}")
+            self.logger.error(f"Error loading token config: {e}", exc_info=True)
+            if not hasattr(self, 'funded_wallets'):
+                self.funded_wallets = []
+            if not hasattr(self, 'total_distributed_bnb'):
+                self.total_distributed_bnb = 0.0
 
     def save_token_config(self):
         """Save token configuration to file."""
         try:
+            # Ensure all current state is saved to token_config
+            if hasattr(self, 'funded_wallets'):
+                self.token_config['funded_wallets'] = self.funded_wallets
+            if hasattr(self, 'total_distributed_bnb'):
+                self.token_config['total_distributed_bnb'] = self.total_distributed_bnb
+                
             config_path = os.path.join(os.path.dirname(__file__), 'token_config.json')
             with open(config_path, 'w') as f:
                 json.dump(self.token_config, f, indent=4)
+                
+            self.logger.info(f"Saved token config: {len(self.funded_wallets)} funded wallets, {self.total_distributed_bnb} BNB distributed")
         except Exception as e:
-            logging.error(f"Error saving token config: {e}")
+            self.logger.error(f"Error saving token config: {e}", exc_info=True)
 
     async def menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Displays the main menu of commands."""
@@ -144,6 +389,7 @@ class TokenTrendingBot:
             "🔹 /connect - Connect a token (format: <code>0x... CHAIN $TICKER</code>)\n"
             "🔹 /create_wallet - Load wallets from wallets.json\n"
             f"🔹 {'⏸️' if self.trading_cycle and self.trading_cycle.is_running else '▶️'} /{'stop' if self.trading_cycle and self.trading_cycle.is_running else 'start'}_trend - {'Stop' if self.trading_cycle and self.trading_cycle.is_running else 'Start'} trending mode\n"
+            "🔹 /refresh_funded - Rescan wallets on-chain to detect funded ones\n"
             "🔹 /menu - Display this menu\n\n"
             "<b>Current Status</b>:\n"
         )
@@ -160,9 +406,19 @@ class TokenTrendingBot:
                 menu_text += f"• Trading Cycle: {status} (Cycle: {self.trading_cycle.current_cycle})\n"
             
             if self.wallets:
+                # Ensure we show funded count even if cache is empty by scanning once
+                try:
+                    if not getattr(self, 'funded_wallets', []):
+                        await self._refresh_funded_from_chain(self.connected_chain or 'BNB')
+                except Exception:
+                    pass
+                funded_count = len(getattr(self, 'funded_wallets', []) or [])
                 group_a = len(self.wallets[:17])
                 group_b = len(self.wallets[17:34])
-                menu_text += f"• Wallets: <b>{len(self.wallets)}</b> total (<b>{group_a}</b> in Group A, <b>{group_b}</b> in Group B)"
+                menu_text += (
+                    f"• Wallets: <b>{len(self.wallets)}</b> total (<b>{group_a}</b> in Group A, <b>{group_b}</b> in Group B)\n"
+                    f"• Funded (>= 0.00085 {self.connected_chain or 'BNB'}): <b>{funded_count}</b>"
+                )
         else:
             menu_text += "No token connected. Use /connect to add one."
         
@@ -197,39 +453,60 @@ class TokenTrendingBot:
         if context.user_data['awaiting_token_info'] == 'all':
             # Parse the input: tokenaddress chain ticker
             parts = user_input.split()
-            if len(parts) < 3:
+            if len(parts) < 2:
                 await self.safe_reply_text(
                     update,
-                    "❌ <b>Invalid format</b>. Please enter:\n"
-                    "<code>&lt;tokenaddress&gt; &lt;chain&gt; &lt;ticker&gt;</code>\n\n"
-                    "Example: <code>0x123...abc BNB TOKEN</code>",
+                    "❌ <b>Invalid format</b>. Please enter at least:\n"
+                    "<code>&lt;tokenaddress&gt; &lt;ticker&gt;</code>\n\n"
+                    "Optionally you can also specify the chain: <code>&lt;tokenaddress&gt; &lt;chain&gt; &lt;ticker&gt;</code>",
                     parse_mode='HTML'
                 )
                 return
-                
+
             token_address = parts[0]
-            chain = parts[1].upper()
-            ticker = parts[2].upper()
+            # If 3 tokens, assume explicit chain provided
+            if len(parts) >= 3:
+                maybe_chain = parts[1].upper()
+                ticker = parts[2].upper()
+                chain = maybe_chain if maybe_chain in {'BNB', 'ETH', 'SOL'} else None
+                if not chain:
+                    # Treat input as <address> <ticker ...>, auto-detect chain
+                    ticker = parts[1].upper()
+                    chain = self.detect_chain_from_address(token_address)
+            else:
+                # 2 parts: <address> <ticker>, auto-detect chain
+                ticker = parts[1].upper()
+                chain = self.detect_chain_from_address(token_address)
+
             
-            # Validate token address (BNB Chain style: 0x-prefixed, 42 chars)
-            if not token_address.startswith('0x') or len(token_address) != 42:
+            # Validate chain and token address format for BNB/ETH/SOL
+            if chain not in {'BNB', 'ETH', 'SOL'}:
                 await self.safe_reply_text(
                     update,
-                    "❌ Invalid token address. Must start with 0x and be 42 characters long.\n\n"
-                    "Please try again with format: \n<code>&lt;tokenaddress&gt; &lt;chain&gt; &lt;ticker&gt;</code>",
+                    "❌ Could not determine chain automatically. Supported chains: <b>BNB</b>, <b>ETH</b>, <b>SOL</b>.\n"
+                    "Please re-enter as: <code>&lt;address&gt; &lt;chain&gt; &lt;ticker&gt;</code>",
                     parse_mode='HTML'
                 )
                 return
-                
-            # Validate chain (BNB only as requested)
-            if chain != 'BNB':
-                await self.safe_reply_text(
-                    update,
-                    "❌ Invalid chain. Please use <b>BNB</b>.\n\n"
-                    "Please try again with format: \n<code>&lt;tokenaddress&gt; BNB &lt;ticker&gt;</code>",
-                    parse_mode='HTML'
-                )
-                return
+
+            if chain in {'BNB', 'ETH'}:
+                # EVM address validation: 0x + 40 hex chars
+                if not (token_address.startswith('0x') and len(token_address) == 42):
+                    await self.safe_reply_text(
+                        update,
+                        "❌ Invalid token address for EVM chain. Must start with 0x and be 42 characters long.",
+                        parse_mode='HTML'
+                    )
+                    return
+            else:  # SOL
+                # Basic Solana address validation: base58-like and reasonable length
+                if token_address.startswith('0x') or not (32 <= len(token_address) <= 48):
+                    await self.safe_reply_text(
+                        update,
+                        "❌ Invalid token address for Solana. Provide a base58 address (no 0x prefix).",
+                        parse_mode='HTML'
+                    )
+                    return
                 
             # Save token info
             self.token_config = {
@@ -240,18 +517,37 @@ class TokenTrendingBot:
             self.save_token_config()
             # Persist primary token address for cycle checks
             self.token_address = token_address
+            # Track connected chain for other features (e.g., /create_wallet)
+            self.connected_chain = chain
             
             # Clear the state
             del context.user_data['awaiting_token_info']
             
-            # Initialize trading cycle if not already done
+            # Initialize trading cycle per chain
             if not hasattr(self, 'trading_cycle') or not self.trading_cycle:
-                self.trading_cycle = TradingCycle(
-                    wallet_manager=self,
-                    web3=self.web3,
-                    token_address=token_address
-                )
+                if chain in {'BNB', 'ETH'}:
+                    w3 = self.get_web3_for_chain(chain)
+                    self.trading_cycle = TradingCycle(
+                        wallet_manager=self,
+                        web3=w3,
+                        token_address=token_address,
+                        chain=chain,
+                    )
+                elif chain == 'SOL':
+                    if SolanaTradingCycle is None:
+                        await self.safe_reply_text(update, "❌ SOL trading engine not available. Missing module.")
+                        return
+                    client = self.get_solana_client()
+                    self.trading_cycle = SolanaTradingCycle(
+                        wallet_manager=self,
+                        client=client,
+                        token_address=token_address,
+                    )
+                else:
+                    await self.safe_reply_text(update, f"❌ Unsupported chain: {chain}")
+                    return
             else:
+                # Update token address on existing cycle
                 self.trading_cycle.token_address = token_address
                 
             # Format the response
@@ -400,8 +696,15 @@ class TokenTrendingBot:
         self.token_config = {
             'address': '',
             'chain': '',
-            'ticker': ''
+            'ticker': '',
+            'funded_wallets': [],
+            'total_distributed_bnb': 0.0
         }
+        # Initialize funded_wallets before loading config
+        self.funded_wallets = []
+        self.total_distributed_bnb = 0.0
+        # Mapping of address -> private_key (populated from wallets file if available)
+        self.wallet_private_keys: dict[str, str] = {}
         self.load_token_config()
 
         # Register command handlers
@@ -413,6 +716,7 @@ class TokenTrendingBot:
         self.app.add_handler(CommandHandler("start_funding", self.start_funding))
         self.app.add_handler(CommandHandler("check_balance", self.check_balance))
         self.app.add_handler(CommandHandler("wallet_status", self.wallet_status))
+        self.app.add_handler(CommandHandler("refresh_funded", self.refresh_funded))
         self.app.add_handler(CommandHandler("cancel", self.cancel))
         self.app.add_handler(CommandHandler("start_trend", self.start_trend))
         self.app.add_handler(CommandHandler("stop_trend", self.stop_trend))
@@ -446,14 +750,73 @@ class TokenTrendingBot:
     async def _fetch_bnb_price_async(self, session, url, parser):
         """Helper method to fetch BNB price asynchronously"""
         try:
-            async with session.get(url, timeout=5) as response:
-                response.raise_for_status()
-                data = await response.json()
-                return parser(data)
+            async with session.get(url, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return parser(data)
         except Exception as e:
-            self.logger.debug(f"Price fetch failed for {url}: {str(e)}")
-            return None
-    
+            self.logger.warning(f"Error fetching BNB price from {url}: {str(e)}")
+        return None
+
+    async def _get_balance_with_retry(self, w3, address, max_retries=3, delay=1):
+        """Helper method to get wallet balance with retry logic"""
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                # Add a small delay between retries
+                if attempt > 0:
+                    await asyncio.sleep(delay * attempt)
+                return w3.eth.get_balance(address)
+            except Exception as e:
+                last_error = e
+                self.logger.warning(f"Attempt {attempt + 1} failed for {address}: {str(e)}")
+        
+        self.logger.error(f"Failed to get balance for {address} after {max_retries} attempts: {str(last_error)}")
+        raise last_error
+
+    async def _refresh_funded_from_chain(self, chain: str, min_balance: float = 0.00085, force: bool = False) -> list:
+        """Scan all loaded wallets on-chain and refresh self.funded_wallets.
+
+        Args:
+            chain: 'BNB' | 'ETH' | 'SOL' (EVM chains supported for now)
+            min_balance: threshold to consider a wallet funded
+            force: if True, always rescan even if cache exists
+
+        Returns: list of dicts: [{'address': str, 'balance': float}, ...]
+        """
+        if not isinstance(self.wallets, list) or not self.wallets:
+            return []
+        if getattr(self, 'funded_wallets', None) and not force:
+            return self.funded_wallets
+
+        chain = (chain or self.connected_chain or 'BNB').upper()
+        if chain not in {'BNB', 'ETH'}:
+            # Only EVM scanning implemented here
+            return getattr(self, 'funded_wallets', []) or []
+
+        try:
+            w3 = self.get_web3_for_chain(chain)
+        except Exception as e:
+            self.logger.warning(f"_refresh_funded_from_chain: cannot init web3 for {chain}: {e}")
+            return getattr(self, 'funded_wallets', []) or []
+
+        detected = []
+        for w in self.wallets:
+            addr = (w.get('address') if isinstance(w, dict) else str(w)).strip()
+            if not addr:
+                continue
+            try:
+                wei = await self._get_balance_with_retry(w3, addr)
+                bal = float(w3.from_wei(wei, 'ether'))
+                if bal >= min_balance:
+                    detected.append({'address': addr, 'balance': bal})
+            except Exception as e:
+                self.logger.debug(f"_refresh_funded_from_chain: skip {addr}: {e}")
+
+        detected.sort(key=lambda x: x['balance'], reverse=True)
+        self.funded_wallets = detected
+        return detected
+
     async def get_bnb_price(self):
         """Fetch the current BNB price in USD with caching and async requests."""
         current_time = time.time()
@@ -515,128 +878,82 @@ class TokenTrendingBot:
         return self._bnb_price_cache['price']
 
     async def fund_wallet(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Start the wallet funding process with dynamic BNB/USD calculation."""
-        # Reload environment variables to get the latest values
-        env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
-        if os.path.exists(env_path):
-            load_dotenv(env_path, override=True)
-            
-        # Update central wallet info from environment
-        self.central_wallet_address = os.getenv('CENTRAL_WALLET_ADDRESS', '').strip()
-        self.central_wallet_private_key = os.getenv('CENTRAL_WALLET_PRIVATE_KEY', '').strip()
-        
-        # Validate the wallet address
-        if not self.central_wallet_address or not self.central_wallet_private_key:
-            await self.safe_reply_text(
-                update,
-                "❌ Central wallet not fully configured.\n"
-                "Please set both CENTRAL_WALLET_ADDRESS and CENTRAL_WALLET_PRIVATE_KEY in your .env file."
-            )
-            return
-            
+        """Show the correct central wallet for the connected chain and its current balance."""
         try:
-            # Convert to checksum address
-            self.central_wallet_address = self.web3.to_checksum_address(self.central_wallet_address)
-        except Exception as e:
-            await self.safe_reply_text(
-                update,
-                f"❌ Invalid wallet address in configuration: {self.central_wallet_address}\n"
-                f"Error: {str(e)}"
-            )
-            return
-            
-        # Log the wallet being used
-        self.logger.info(f"Using central wallet: {self.central_wallet_address}")
-        
-        # Start a loading message with the wallet address
-        loading_message = await self.safe_reply_text(
-            update,
-            (
-                "🔍 <b>Fetching data for wallet</b>\n\n"
-                f"<pre>{self.central_wallet_address}</pre>"
-            ),
-            parse_mode='HTML'
-        )
-            
-        try:
-            # Get BNB price and wallet balance in parallel
-            bnb_price_task = asyncio.create_task(self.get_bnb_price())
-            
-            # Get wallet balance with retries and a short timeout
-            balance_wei = None
-            last_err = None
-            for attempt in range(3):
-                try:
-                    if hasattr(self.web3.provider, 'make_request'):
-                        balance_wei = await asyncio.get_event_loop().run_in_executor(
-                            None,
-                            lambda: self.web3.eth.get_balance(self.central_wallet_address)
-                        )
-                    else:
-                        balance_wei = self.web3.eth.get_balance(self.central_wallet_address)
-                    break
-                except Exception as e:
-                    last_err = e
-                    self.logger.warning(f"get_balance attempt {attempt+1}/3 failed: {e}")
-                    # Reinitialize web3 once on first failure
-                    if attempt == 0:
-                        try:
-                            self.initialize_web3()
-                        except Exception:
-                            pass
-                    await asyncio.sleep(0.8)
-
-            if balance_wei is None:
-                self.logger.error(f"Error getting wallet balance: {str(last_err)}")
-                await loading_message.edit_text(
-                    (
-                        "❌ <b>Error fetching wallet data</b>\n\n"
-                        "Please try again in a moment."
-                    ),
-                    parse_mode='HTML'
-                )
+            chain = getattr(self, 'connected_chain', None) or self.token_config.get('chain')
+            if not chain:
+                await self.safe_reply_text(update, "❌ Please connect a token first so I can determine the chain.")
                 return
 
-            # Wait for price with timeout
-            try:
-                bnb_price = await asyncio.wait_for(bnb_price_task, timeout=3.0)
-            except asyncio.TimeoutError:
-                bnb_price = self._bnb_price_cache['price']  # Use cached price if timeout
+            cw = self.get_central_wallet(chain)
+            address = (cw.get('address') or '').strip()
+            pkey = (cw.get('private_key') or '').strip()
+            if not address or not pkey:
+                await self.safe_reply_text(
+                    update,
+                    f"❌ Central wallet for {chain} not configured. Please set the appropriate environment variables.")
+                return
 
-            balance_bnb = self.web3.from_wei(balance_wei, 'ether')
-            balance_usd = float(balance_bnb) * bnb_price
-            
-            # Calculate how many wallets we can fund
-            min_required_usd = 2.00  # $1 per wallet + $1 reserve
-            if balance_usd < min_required_usd:
-                needed_usd = min_required_usd - balance_usd
-                needed_bnb = needed_usd / bnb_price if bnb_price else 0.0
+            # Get current token price for USD conversion
+            bnb_price = await self.get_bnb_price()
 
-                bsc_scan_link = f"https://bscscan.com/address/{self.central_wallet_address}"
+            # Show loading with the address
+            loading_message = await self.safe_reply_text(
+                update,
+                (
+                    f"🔍 <b>{chain} Central Wallet</b>\n\n"
+                    f"<pre>{address}</pre>\n"
+                    "Fetching balance and current prices..."
+                ),
+                parse_mode='HTML'
+            )
+
+            if chain in {'BNB', 'ETH'}:
+                w3 = self.get_web3_for_chain(chain)
+                try:
+                    checksum = w3.to_checksum_address(address)
+                except Exception:
+                    checksum = address
+                # Fetch balance
+                balance_wei = w3.eth.get_balance(checksum)
+                balance_native = float(w3.from_wei(balance_wei, 'ether'))
+                symbol = 'BNB' if chain == 'BNB' else 'ETH'
+                usd_value = balance_native * bnb_price if bnb_price else 0.0
+                usd_display = f"(${usd_value:,.2f} USD)" if bnb_price else ""
+                explorer = 'https://bscscan.com' if chain == 'BNB' else 'https://etherscan.io'
+                link = f"{explorer}/address/{checksum}"
                 msg = (
-                    "❌ <b>Need at least ${:.2f} to fund 1 wallet</b>\n\n"
-                    "• <b>Current</b>: ${:.2f} (<code>{:.6f} BNB</code>)\n"
-                    "• <b>BNB Price</b>: ${:.4f}\n\n"
-                    "Send at least <b>${:.2f}</b> (≈<code>{:.6f} BNB</code>) more to:\n\n"
-                    "<pre>{}</pre>\n"
-                    "BscScan: <a href=\"{}\">{}</a>\n\n"
-                    "After sending, use /check_balance to verify the transaction."
-                ).format(
-                    min_required_usd,
-                    balance_usd,
-                    float(balance_bnb),
-                    bnb_price,
-                    needed_usd,
-                    needed_bnb,
-                    self.central_wallet_address,
-                    bsc_scan_link,
-                    bsc_scan_link,
+                    f"✅ <b>{chain} Central Wallet</b>\n\n"
+                    f"<pre>{checksum}</pre>\n"
+                    f"• Balance: <b>{balance_native:.6f} {symbol}</b> {usd_display}\n"
+                    f"• Current {symbol} Price: <b>${bnb_price:,.4f} USD</b>\n\n"
+                    f"Explorer: <a href=\"{link}\">{link}</a>"
                 )
                 await loading_message.edit_text(msg, parse_mode='HTML', disable_web_page_preview=True)
                 return
+            elif chain == 'SOL':
+                client = self.get_solana_client()
+                from solders.pubkey import Pubkey
+                lamports = client.get_balance(Pubkey.from_string(address)).value
+                balance_sol = lamports / 1_000_000_000
+                usd_value = balance_sol * bnb_price if bnb_price else 0.0
+                usd_display = f"(${usd_value:,.2f} USD)" if bnb_price else ""
+                link = f"https://solscan.io/address/{address}"
+                msg = (
+                    f"✅ <b>SOL Central Wallet</b>\n\n"
+                    f"<pre>{address}</pre>\n"
+                    f"• Balance: <b>{balance_sol:.6f} SOL</b> {usd_display}\n"
+                    f"• Current SOL Price: <b>${bnb_price:,.4f} USD</b>\n\n"
+                    f"Explorer: <a href=\"{link}\">{link}</a>"
+                )
+                await loading_message.edit_text(msg, parse_mode='HTML', disable_web_page_preview=True)
+                return
+            else:
+                await loading_message.edit_text(f"❌ Unsupported chain: {chain}")
+                return
         except Exception as e:
             self.logger.error(f"Error in fund_wallet: {str(e)}", exc_info=True)
-            await self.safe_reply_text(update, "❌ An error occurred while checking balances. Please try again later.")
+            await self.safe_reply_text(update, "❌ An error occurred. Please try again later.")
 
     def _escape_markdown(self, text: str) -> str:
         """Escape a minimal set of Markdown characters to avoid Telegram parse errors.
@@ -657,17 +974,41 @@ class TokenTrendingBot:
             await self.safe_reply_text(update, "❌ No wallets found to fund.")
             return
             
-        if not self.central_wallet_private_key or not self.central_wallet_address:
-            await self.safe_reply_text(update, "❌ Central wallet not configured.")
+        # Get chain from context or token config
+        chain = getattr(self, 'connected_chain', None) or self.token_config.get('chain')
+        if not chain:
+            await self.safe_reply_text(update, "❌ No chain configured. Please connect a token first.")
+            return
+            
+        # Get chain-specific wallet config
+        cw = self.get_central_wallet(chain)
+        address = (cw.get('address') or '').strip()
+        pkey = (cw.get('private_key') or '').strip()
+        
+        if not address or not pkey:
+            await self.safe_reply_text(update, f"❌ Central wallet for {chain} not configured.")
             return
             
         bnb_per_wallet = funding_details['bnb_per_wallet']
+        
+        # Update funding details with wallet info
+        funding_details.update({
+            'chain': chain,
+            'wallet_address': address,
+            'wallet_private_key': pkey
+        })
         max_wallets = funding_details['max_wallets']
         
         try:
+            # Get Web3 instance for the correct chain
+            chain = funding_details['chain']
+            w3 = self.get_web3_for_chain(chain)
+            wallet_address = funding_details['wallet_address']
+            wallet_private_key = funding_details['wallet_private_key']
+            
             # Recheck balance in case it changed
-            balance_wei = self.web3.eth.get_balance(self.central_wallet_address)
-            balance_bnb = float(self.web3.from_wei(balance_wei, 'ether'))
+            balance_wei = w3.eth.get_balance(wallet_address)
+            balance_bnb = float(w3.from_wei(balance_wei, 'ether'))
             
             # Adjust if balance changed since plan was made
             gas_reserve_usd = float(funding_details.get('gas_reserve_usd', 1.0))
@@ -682,7 +1023,7 @@ class TokenTrendingBot:
                             "❌ <b>Insufficient balance</b>\n\n"
                             f"Need at least <b>${min_needed_usd:.2f}</b> to fund 1 wallet after gas reserve.\n\n"
                             "Send more BNB to:\n"
-                            f"<pre>{self.central_wallet_address}</pre>"
+                            f"<pre>{wallet_address}</pre>"
                         ),
                         parse_mode='HTML'
                     )
@@ -701,8 +1042,8 @@ class TokenTrendingBot:
             for i, wallet in enumerate(self.wallets[:max_wallets], 1):
                 try:
                     # Check if we still have enough balance (in case of network fees)
-                    current_balance = float(self.web3.from_wei(
-                        self.web3.eth.get_balance(self.central_wallet_address), 'ether'
+                    current_balance = float(w3.from_wei(
+                        w3.eth.get_balance(wallet_address), 'ether'
                     ))
                     
                     if current_balance < bnb_per_wallet * 1.1:  # Include 10% buffer for gas
@@ -710,12 +1051,12 @@ class TokenTrendingBot:
                         break
                     
                     # Prepare transaction
-                    nonce = self.web3.eth.get_transaction_count(self.central_wallet_address)
+                    nonce = w3.eth.get_transaction_count(wallet_address)
                     
                     # Calculate gas cost
-                    gas_price = self.web3.eth.gas_price
+                    gas_price = w3.eth.gas_price
                     gas_limit = 21000  # Standard transfer gas limit
-                    gas_cost = self.web3.from_wei(gas_price * gas_limit, 'ether')
+                    gas_cost = w3.from_wei(gas_price * gas_limit, 'ether')
                     
                     # Amount to send (BNB per wallet minus gas cost)
                     send_amount = bnb_per_wallet - float(gas_cost)
@@ -724,19 +1065,23 @@ class TokenTrendingBot:
                         self.logger.error(f"Gas cost {gas_cost} exceeds send amount {bnb_per_wallet}")
                         continue
                     
+                    # Get chain ID based on the chain
+                    chain_id = 56 if chain == 'BNB' else 1  # Default to BSC (56) or ETH (1)
+                    
                     tx = {
                         'nonce': nonce,
                         'to': wallet['address'],
-                        'value': self.web3.to_wei(send_amount, 'ether'),
+                        'value': w3.to_wei(send_amount, 'ether'),
                         'gas': gas_limit,
                         'gasPrice': gas_price,
-                        'chainId': 56  # BSC Mainnet
+                        'chainId': chain_id
                     }
                     
                     # Sign and send transaction
-                    signed_tx = self.web3.eth.account.sign_transaction(tx, self.central_wallet_private_key)
-                    tx_hash = self.web3.eth.send_raw_transaction(signed_tx.rawTransaction)
-                    tx_receipt = self.web3.eth.wait_for_transaction_receipt(tx_hash)
+                    signed_tx = w3.eth.account.sign_transaction(tx, wallet_private_key)
+                    # Use raw_transaction (with underscore) for newer Web3.py versions
+                    tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                    tx_receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
                     
                     if tx_receipt.status == 1:
                         success_count += 1
@@ -759,24 +1104,19 @@ class TokenTrendingBot:
             # Update list of funded wallets for trading
             self.funded_wallets = funded_wallets
             
-            # Save funded wallets to config
+            # Track total distributed (BNB) across runs
+            self.total_distributed_bnb = float(getattr(self, 'total_distributed_bnb', 0.0) or 0.0)
+            self.total_distributed_bnb += float(success_count) * float(bnb_per_wallet)
+            
+            # Update token config with both funded_wallets and total_distributed_bnb
             self.token_config['funded_wallets'] = self.funded_wallets
-            # Persist running total of distributed BNB
-            self.token_config['total_distributed_bnb'] = float(getattr(self, 'total_distributed_bnb', 0.0) or 0.0)
-            with open('token_config.json', 'w') as f:
-                json.dump(self.token_config, f, indent=2)
+            self.token_config['total_distributed_bnb'] = self.total_distributed_bnb
+            self.save_token_config()
             
             # Final status update
-            final_balance = float(self.web3.from_wei(
-                self.web3.eth.get_balance(self.central_wallet_address), 'ether'
+            final_balance = float(w3.from_wei(
+                w3.eth.get_balance(wallet_address), 'ether'
             ))
-            
-            # Track total distributed (BNB) across runs
-            try:
-                self.total_distributed_bnb = float(getattr(self, 'total_distributed_bnb', 0.0))
-            except Exception:
-                self.total_distributed_bnb = 0.0
-            self.total_distributed_bnb += float(success_count) * float(bnb_per_wallet)
             
             await self.safe_edit_text(
                 status_msg,
@@ -791,16 +1131,19 @@ class TokenTrendingBot:
             # Also send a final confirmation message in chat
             try:
                 usd_per_wallet = float(funding_details.get('usd_per_wallet', 1.0))
+                explorer_url = f"https://bscscan.com/address/{wallet_address}" if chain == 'BNB' else f"https://etherscan.io/address/{wallet_address}"
                 summary_text = (
                     "✅ <b>Funding Completed</b>\n\n"
                     f"• Funded wallets: <b>{success_count}/{max_wallets}</b>\n"
                     f"• Per wallet: <code>{bnb_per_wallet:.6f} BNB</code> (≈${usd_per_wallet:.2f})\n"
                     f"• Total sent: <code>{success_count * bnb_per_wallet:.6f} BNB</code>\n"
-                    f"• Remaining: <code>{final_balance:.6f} BNB</code>\n"
+                    f"• Remaining: <code>{final_balance:.6f} BNB</code>\n\n"
+                    f"<a href=\"{explorer_url}\">View on Explorer</a>"
                 )
                 await self.safe_reply_text(update, summary_text, parse_mode='HTML')
-            except Exception:
-                pass
+            except Exception as e:
+                self.logger.error(f"Error sending summary: {str(e)}")
+                await self.safe_reply_text(update, "✅ Funding completed, but there was an error generating the summary.")
             
         except Exception as e:
             self.logger.error(f"Error in distribute_funds: {str(e)}\n{traceback.format_exc()}")
@@ -929,67 +1272,95 @@ class TokenTrendingBot:
         return None
 
     async def create_wallet(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Reads pre-generated wallets from wallets.json and displays them."""
-        # Check if token details are connected
-        if not all(key in self.token_config for key in ['address', 'chain', 'ticker']):
+        """Reads pre-generated wallets for the connected chain and displays addresses only (one per line)."""
+        # Determine connected chain
+        chain = getattr(self, 'connected_chain', None) or self.token_config.get('chain')
+        if not chain:
             await self.safe_reply_text(update, "❌ Please connect token details first using /connect command.")
             return
-            
-        await self.safe_reply_text(update, "🔎 Checking for pre-generated wallets...")
-        
+
+        await self.safe_reply_text(update, f"🔎 Loading pre-generated wallets for {chain}...")
+
         try:
-            # Construct the absolute path to wallets.json relative to this script
             bot_dir = os.path.dirname(os.path.abspath(__file__))
-            wallets_file_path = os.path.join(bot_dir, '..', 'hardhat-scripts', 'wallets.json')
+            if chain == 'BNB':
+                wallets_file_path = os.path.join(bot_dir, '..', 'hardhat-scripts', 'wallets.json')
+            elif chain == 'ETH':
+                wallets_file_path = os.path.join(bot_dir, 'eth_wallet.json')
+            elif chain == 'SOL':
+                wallets_file_path = os.path.join(bot_dir, 'sol_wallet.json')
+            else:
+                await self.safe_reply_text(update, f"❌ Unsupported chain: {chain}")
+                return
+
+            wallets_file_path = os.path.normpath(wallets_file_path)
             self.logger.info(f"Looking for wallets at: {wallets_file_path}")
 
             if not os.path.exists(wallets_file_path):
+                fname = os.path.basename(wallets_file_path)
+                hint = "Run the generator script: gen_eth_wallets.py" if chain == 'ETH' else ("gen_sol_wallets.py" if chain == 'SOL' else "hardhat generation script")
                 error_msg = (
-                    "❌ <b>wallets.json not found</b>\n\n"
-                    "Please run the wallet generation script manually in your terminal first.\n"
-                    "Expected location: <code>hardhat-scripts/wallets.json</code>"
+                    f"❌ <b>{fname} not found</b>\n\n"
+                    f"Please run the wallet generation script manually in your terminal first (e.g., <code>{hint}</code>).\n"
+                    f"Expected location: <code>{fname}</code>"
                 )
                 await self.safe_reply_text(update, error_msg, parse_mode='HTML')
                 return
 
-            # Read the file with explicit encoding
             with open(wallets_file_path, 'r', encoding='utf-8') as f:
                 try:
                     wallets = json.load(f)
                 except json.JSONDecodeError as e:
                     error_msg = (
-                        "❌ <b>Error reading wallets.json</b> — file is corrupted or empty.\n\n"
+                        f"❌ <b>Error reading {os.path.basename(wallets_file_path)}</b> — file is corrupted or empty.\n\n"
                         f"Error: <code>{self._escape_markdown(str(e))}</code>\n\n"
-                        "Please run the wallet generation script again."
+                        "Please regenerate the wallets file."
                     )
                     await self.safe_reply_text(update, error_msg, parse_mode='HTML')
                     return
-            
+
             if not isinstance(wallets, list):
-                error_msg = "❌ Invalid format in <code>wallets.json</code>. Expected a list of wallet objects."
-                await self.safe_reply_text(update, error_msg, parse_mode='HTML')
-                return
-            
-            self.wallets = wallets
-            addresses = [w.get('address') for w in wallets if w and isinstance(w, dict) and w.get('address')]
-
-            if not addresses:
-                error_msg = "⚠️ <code>wallets.json</code> is empty or malformed. Please run the generation script again."
-                await self.safe_reply_text(update, error_msg, parse_mode='HTML')
+                await self.safe_reply_text(update, f"❌ Invalid format in <code>{os.path.basename(wallets_file_path)}</code>.", parse_mode='HTML')
                 return
 
-            response = f"✅ Found {len(addresses)} pre-generated wallets.\n\n"
-            response += "\n".join(addresses)
-            
-            # Split the message into chunks to avoid hitting Telegram's message length limit
-            chunk_size = 3000  # Conservative chunk size to account for markdown characters
+            # Normalize wallet objects to have address (private keys ignored for output)
+            normalized = []
+            for w in wallets:
+                if not isinstance(w, dict):
+                    continue
+                addr = w.get('address') or w.get('addr')
+                if addr:
+                    # capture private key into mapping if present in file (do not display)
+                    try:
+                        pk = (
+                            w.get('private_key')
+                            or w.get('privateKey')
+                            or w.get('key')
+                            or w.get('pkey')
+                        )
+                        if pk:
+                            self.wallet_private_keys[addr] = pk
+                    except Exception:
+                        pass
+                    normalized.append({"address": addr})
+
+            if not normalized:
+                await self.safe_reply_text(update, "⚠️ Wallet list is empty or missing keys. Regenerate and try again.")
+                return
+
+            # Save in session (addresses only)
+            self.wallets = normalized
+
+            # Format output: one address per line (up to 34)
+            lines = [w['address'] for w in normalized[:34]]
+            response = f"✅ Found {len(normalized)} pre-generated wallets for {chain}. Showing up to 34.\n\n" + "\n".join(lines)
+
+            # Chunk and send
+            chunk_size = 3000
             chunks = [response[i:i + chunk_size] for i in range(0, len(response), chunk_size)]
-            
             for i, chunk in enumerate(chunks):
                 try:
-                    # Send chunks without Markdown parse mode to avoid entity errors on large messages
                     await self.safe_reply_text(update, chunk)
-                    # Small delay between chunks to avoid rate limiting
                     if i < len(chunks) - 1:
                         await asyncio.sleep(1)
                 except Exception as e:
@@ -999,12 +1370,7 @@ class TokenTrendingBot:
         except Exception as e:
             tb_str = traceback.format_exc()
             self.logger.error(f"Critical error in create_wallet: {tb_str}")
-            error_msg = (
-                "❌ An unexpected error occurred while processing wallets.\n\n"
-                f"Error: {str(e)}\n\n"
-                "Please check the logs for more details."
-            )
-            await self.safe_reply_text(update, error_msg)
+            await self.safe_reply_text(update, "❌ An unexpected error occurred while processing wallets.")
 
     async def start_funding(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start funding generated wallets if central wallet has >= $2.
@@ -1018,8 +1384,49 @@ class TokenTrendingBot:
             if not self.wallets:
                 await self.safe_reply_text(update, "❌ No wallets loaded. Use /create_wallet first.")
                 return
-            if not self.central_wallet_address:
-                await self.safe_reply_text(update, "❌ Central wallet not configured.")
+
+            # Resolve chain and central wallet (BNB supported)
+            chain = getattr(self, 'connected_chain', None) or (self.token_config.get('chain') if hasattr(self, 'token_config') else None)
+            if not chain:
+                await self.safe_reply_text(update, "❌ Please connect a token first so I can determine the chain.")
+                return
+            if chain != 'BNB':
+                await self.safe_reply_text(update, f"❌ Funding is currently supported on BNB only. Detected: {chain}.")
+                return
+                
+            # Debug: Log wallet config
+            legacy_address = getattr(self, 'central_wallet_address', 'Not set')
+            self.logger.info(f"Legacy wallet address: {legacy_address}")
+            
+            # Try to get wallet from chain-specific config first
+            cw = self.get_central_wallet(chain)
+            self.logger.info(f"Chain {chain} wallet config - Address: {'Set' if cw.get('address') else 'Not set'}, Key: {'Set' if cw.get('private_key') else 'Not set'}")
+            
+            address = (cw.get('address') or '').strip()
+            pkey = (cw.get('private_key') or '').strip()
+            
+            # Fall back to legacy config if chain-specific config is not found
+            if not address or not pkey:
+                self.logger.warning(f"No {chain} central wallet found, falling back to legacy config")
+                address = getattr(self, 'central_wallet_address', '').strip()
+                pkey = getattr(self, 'central_wallet_private_key', '').strip()
+                self.logger.info(f"Legacy fallback - address: {'[REDACTED]' if address else 'Not set'}, key: {'[REDACTED]' if pkey else 'Not set'}")
+            
+            # Check if we have valid wallet credentials
+            if not address or not pkey:
+                # Log environment variables for debugging (without sensitive data)
+                env_vars = {k: v for k, v in os.environ.items() 
+                          if any(x in k.upper() for x in ['WALLET', 'CENTRAL', 'BSC_', 'ETH_', 'SOL_'])}
+                self.logger.warning(f"Wallet-related environment variables: {env_vars}")
+                
+                error_msg = (
+                    f"❌ No central wallet configured for {chain}.\n\n"
+                    "Please set one of these environment variable pairs in your .env file:\n"
+                    "- For BNB: BSC_CENTRAL_WALLET and BSC_CENTRAL_WALLET_KEY\n"
+                    "- Legacy (deprecated): CENTRAL_WALLET_ADDRESS and CENTRAL_WALLET_PRIVATE_KEY\n\n"
+                    f"Current config - Address: {'Set' if address else 'Not set'}, Private Key: {'Set' if pkey else 'Not set'}"
+                )
+                await self.safe_reply_text(update, error_msg)
                 return
 
             # Get BNB price
@@ -1028,9 +1435,14 @@ class TokenTrendingBot:
                 await self.safe_reply_text(update, "❌ Could not fetch BNB price. Try again later.")
                 return
 
-            # Central wallet balance
-            balance_wei = self.web3.eth.get_balance(self.central_wallet_address)
-            balance_bnb = float(self.web3.from_wei(balance_wei, 'ether'))
+            # Central wallet balance (per-chain Web3)
+            w3 = self.get_web3_for_chain(chain)
+            try:
+                checksum = w3.to_checksum_address(address)
+            except Exception:
+                checksum = address
+            balance_wei = w3.eth.get_balance(checksum)
+            balance_bnb = float(w3.from_wei(balance_wei, 'ether'))
             balance_usd = balance_bnb * bnb_price
 
             # Read configurable funding parameters (clamped to exactly $1.00 as policy)
@@ -1055,14 +1467,14 @@ class TokenTrendingBot:
             if balance_usd < min_required_usd:
                 needed_usd = min_required_usd - balance_usd
                 needed_bnb = needed_usd / bnb_price if bnb_price else 0.0
-                bsc_scan_link = f"https://bscscan.com/address/{self.central_wallet_address}"
+                bsc_scan_link = f"https://bscscan.com/address/{checksum}"
 
                 msg = (
                     f"❌ <b>Need at least ${min_required_usd:.2f} to start funding</b>\n\n"
                     f"• <b>Current</b>: ${balance_usd:.2f} (<code>{balance_bnb:.6f} BNB</code>)\n"
                     f"• <b>BNB Price</b>: ${bnb_price:.4f}\n\n"
                     f"Send at least <b>${needed_usd:.2f}</b> (≈<code>{needed_bnb:.6f} BNB</code>) more to:\n\n"
-                    f"<pre>{self.central_wallet_address}</pre>\n"
+                    f"<pre>{checksum}</pre>\n"
                     f"BscScan: <a href=\"{bsc_scan_link}\">{bsc_scan_link}</a>\n\n"
                     "After sending, use /check_balance to verify the transaction."
                 )
@@ -1094,9 +1506,17 @@ class TokenTrendingBot:
             await self.safe_reply_text(update, "❌ Failed to start funding. Please check logs and try again.")
 
     async def check_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Check the balance of the central wallet (only)."""
-        if not hasattr(self, 'central_wallet_address') or not self.central_wallet_address:
-            await self.safe_reply_text(update, "❌ Central wallet not configured.")
+        """Check the balance of the central wallet for the currently connected chain."""
+        # Resolve chain from connection state
+        chain = getattr(self, 'connected_chain', None) or (self.token_config.get('chain') if hasattr(self, 'token_config') else None)
+        if not chain:
+            await self.safe_reply_text(update, "❌ Please connect a token first so I can determine the chain.")
+            return
+        cw = self.get_central_wallet(chain)
+        address = (cw.get('address') or '').strip()
+        pkey = (cw.get('private_key') or '').strip()
+        if not address or not pkey:
+            await self.safe_reply_text(update, f"❌ Central wallet for {chain} not configured. Please set the appropriate environment variables.")
             return
         try:
             # Typing indicator (best effort)
@@ -1105,46 +1525,161 @@ class TokenTrendingBot:
             except Exception:
                 pass
 
-            bnb_price = await self.get_bnb_price()
-            if not bnb_price:
-                raise ValueError("Could not fetch BNB price")
-
-            balance_wei = self.web3.eth.get_balance(self.central_wallet_address)
-            balance_bnb = float(self.web3.from_wei(balance_wei, 'ether'))
-            balance_usd = balance_bnb * float(bnb_price)
-
-            addr_short = f"{self.central_wallet_address[:6]}...{self.central_wallet_address[-4:]}"
-            response_text = (
-                "💰 <b>Wallet Balance</b>\n\n"
-                "<b>Central Wallet</b>\n"
-                f"• Address: <code>{addr_short}</code>\n"
-                f"• Balance: <code>{balance_bnb:.6f} BNB</code>\n"
-                f"• USD: <code>${balance_usd:.2f}</code>\n"
-                f"• BscScan: https://bscscan.com/address/{self.central_wallet_address}\n"
-            )
-            await self.safe_reply_text(update, response_text, parse_mode='HTML')
+            if chain in {'BNB', 'ETH'}:
+                # Fetch price for USD display when on EVM
+                bnb_price = await self.get_bnb_price()
+                if not bnb_price:
+                    raise ValueError("Could not fetch BNB price")
+                w3 = self.get_web3_for_chain(chain)
+                try:
+                    checksum = w3.to_checksum_address(address)
+                except Exception:
+                    checksum = address
+                balance_wei = w3.eth.get_balance(checksum)
+                balance_native = float(w3.from_wei(balance_wei, 'ether'))
+                usd = balance_native * float(bnb_price)
+                symbol = 'BNB' if chain == 'BNB' else 'ETH'
+                explorer = 'https://bscscan.com' if chain == 'BNB' else 'https://etherscan.io'
+                addr_short = f"{checksum[:6]}...{checksum[-4:]}"
+                response_text = (
+                    "💰 <b>Wallet Balance</b>\n\n"
+                    f"<b>{chain} Central Wallet</b>\n"
+                    f"• Address: <code>{addr_short}</code>\n"
+                    f"• Balance: <code>{balance_native:.6f} {symbol}</code>\n"
+                    f"• USD: <code>${usd:.2f}</code>\n"
+                    f"• Explorer: {explorer}/address/{checksum}\n"
+                )
+                await self.safe_reply_text(update, response_text, parse_mode='HTML')
+                return
+            elif chain == 'SOL':
+                client = self.get_solana_client()
+                from solders.pubkey import Pubkey
+                lamports = client.get_balance(Pubkey.from_string(address)).value
+                balance_sol = lamports / 1_000_000_000
+                addr_short = f"{address[:6]}...{address[-4:]}"
+                response_text = (
+                    "💰 <b>Wallet Balance</b>\n\n"
+                    f"<b>SOL Central Wallet</b>\n"
+                    f"• Address: <code>{addr_short}</code>\n"
+                    f"• Balance: <code>{balance_sol:.6f} SOL</code>\n"
+                    f"• Explorer: https://solscan.io/address/{address}\n"
+                )
+                await self.safe_reply_text(update, response_text, parse_mode='HTML')
+                return
+            else:
+                await self.safe_reply_text(update, f"❌ Unsupported chain: {chain}")
+                return
         except Exception as e:
-            self.logger.error(f"Error in check_balance: {str(e)}")
+            self.logger.error(f"Error in check_balance: {str(e)}", exc_info=True)
             await self.safe_reply_text(update, "❌ An error occurred while checking balances. Please try again later.")
 
     async def wallet_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show number of generated wallets, count funded, and total distributed."""
         try:
             generated = len(self.wallets) if isinstance(self.wallets, list) else 0
-            funded_list = getattr(self, 'funded_wallets', []) or []
-            funded_count = len(funded_list) if isinstance(funded_list, list) else 0
-            total_distributed_bnb = float(getattr(self, 'total_distributed_bnb', 0.0) or 0.0)
 
-            text = (
-                "📊 <b>Wallet Status</b>\n\n"
-                f"• Generated wallets: <b>{generated}</b>\n"
-                f"• Funded wallets: <b>{funded_count}</b>\n"
-                f"• Total distributed: <code>{total_distributed_bnb:.6f} BNB</code>\n"
+            # Ensure attributes exist
+            if not hasattr(self, 'funded_wallets') or not isinstance(self.funded_wallets, list):
+                self.funded_wallets = []
+            if not hasattr(self, 'total_distributed_bnb'):
+                self.total_distributed_bnb = 0.0
+
+            # If we don't have a funded cache, scan all wallets to detect manual funding
+            funded_list = list(self.funded_wallets)
+            if generated > 0 and not funded_list:
+                try:
+                    chain = (self.connected_chain or 'BNB').upper()
+                    w3 = self.get_web3_for_chain(chain)
+                    min_balance = 0.00085
+                    funded_detected = []
+                    total_detected_balance = 0.0
+
+                    for wallet in self.wallets:
+                        addr = (wallet.get('address') if isinstance(wallet, dict) else str(wallet)).strip()
+                        if not addr:
+                            continue
+                        try:
+                            wei = await self._get_balance_with_retry(w3, addr)
+                            bal = float(w3.from_wei(wei, 'ether'))
+                            if bal >= min_balance:
+                                funded_detected.append({'address': addr, 'balance': bal})
+                                total_detected_balance += bal
+                        except Exception as e:
+                            self.logger.warning(f"wallet_status: balance check failed for {addr}: {e}")
+
+                    # Update cache for future commands
+                    if funded_detected:
+                        # Keep only address and balance
+                        funded_detected.sort(key=lambda x: x['balance'], reverse=True)
+                        self.funded_wallets = funded_detected
+                        funded_list = funded_detected
+                        self.logger.info(f"wallet_status: detected {len(funded_detected)} funded wallets on-chain")
+                except Exception as e:
+                    self.logger.warning(f"wallet_status: on-chain scan skipped due to error: {e}")
+
+            funded_count = len(funded_list)
+            total_bnb_distributed = float(self.total_distributed_bnb or 0.0)
+
+            # Build summary, including a quick preview of detected funded wallets (Option A)
+            preview = ''
+            if funded_list:
+                top = funded_list[:3]
+                lines = []
+                for w in top:
+                    addr = w.get('address', '')
+                    bal = float(w.get('balance', 0.0) or 0.0)
+                    lines.append(f"• <code>{addr[:6]}...{addr[-4:]}</code> — {bal:.4f} BNB")
+                more = f"\n• ...and {len(funded_list) - len(top)} more" if len(funded_list) > len(top) else ''
+                preview = "\n\n<b>Detected funded wallets</b>:\n" + "\n".join(lines) + more
+
+            self.logger.info(
+                f"Wallet Status - Generated: {generated}, Funded: {funded_count}, Total Distributed BNB: {total_bnb_distributed:.6f}"
             )
-            await self.safe_reply_text(update, text, parse_mode='HTML')
+
+            status_text = (
+                "📊 <b>Wallet Status</b>\n\n"
+                f"• Generated Wallets: <b>{generated}</b>\n"
+                f"• Funded Wallets (>= 0.00085 BNB): <b>{funded_count}</b>\n"
+                f"• Total BNB Distributed (funding): <b>{total_bnb_distributed:.6f}</b>"
+                f"{preview}"
+            )
+
+            await self.safe_reply_text(update, status_text, parse_mode='HTML')
+            
         except Exception as e:
-            self.logger.error(f"Error in wallet_status: {str(e)}", exc_info=True)
-            await self.safe_reply_text(update, "❌ Failed to fetch wallet status. Please try again later.")
+            self.logger.error(f"Error in wallet_status: {e}", exc_info=True)
+            await self.safe_reply_text(update, "❌ An error occurred while fetching wallet status. Check logs for details.") 
+
+    async def refresh_funded(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Rescan all loaded wallets on-chain and refresh funded cache."""
+        try:
+            if not self.wallets:
+                await self.safe_reply_text(update, "❌ No wallets loaded. Use /create_wallet first.")
+                return
+            chain = (self.connected_chain or 'BNB').upper()
+            msg = await self.safe_reply_text(update, "🔄 Scanning wallets on-chain for funded balances...")
+            detected = await self._refresh_funded_from_chain(chain, min_balance=0.00085, force=True)
+            count = len(detected)
+            if count == 0:
+                await self.safe_edit_text(msg, "❌ No funded wallets detected (>= 0.00085).")
+                return
+            total = sum(w.get('balance', 0.0) for w in detected)
+            lines = []
+            for w in detected[:5]:
+                addr = w['address']
+                bal = float(w.get('balance', 0.0) or 0.0)
+                lines.append(f"• <code>{addr[:6]}...{addr[-4:]}</code> — {bal:.4f} {chain}")
+            more = f"\n• ...and {count-5} more" if count > 5 else ''
+            text = (
+                f"✅ <b>Detected {count} funded wallets</b> (≥ 0.00085 {chain})\n"
+                f"💼 <b>Total balance:</b> {total:.4f} {chain}\n\n"
+                + "\n".join(lines)
+                + more
+            )
+            await self.safe_edit_text(msg, text, parse_mode='HTML')
+        except Exception as e:
+            self.logger.error(f"Error in refresh_funded: {e}", exc_info=True)
+            await self.safe_reply_text(update, "❌ Failed to refresh funded wallets. Check logs.")
 
     async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Cancel any ongoing interactive operation and clear related state."""
@@ -1167,43 +1702,253 @@ class TokenTrendingBot:
             await self.safe_reply_text(update, "ℹ️ No operation to cancel.")
 
     async def start_trend(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Start trading/trending after pre-flight checks."""
+        """Start trading/trending after comprehensive pre-flight checks."""
         try:
-            # Pre-flight: require valid connected token every time
+            # Initialize payment tracking if not exists
+            if 'payment_id' not in context.user_data:
+                context.user_data['payment_id'] = str(uuid.uuid4())
+                self.logger.info(f"Initialized new payment_id: {context.user_data['payment_id']}")
+            
+            # Send initial status message
+            status_msg = await self.safe_reply_text(update, "🔍 Starting pre-flight checks...")
+            
+            # 1. Token validation
+            await self.safe_edit_text(status_msg, "🔍 Validating token details...")
             token_addr = getattr(self, 'token_address', None) or (self.token_config.get('address') if hasattr(self, 'token_config') else None)
-            if not token_addr or not str(token_addr).startswith('0x') or len(str(token_addr)) != 42:
-                await self.safe_reply_text(update, "❌ No valid token connected. Please use /connect to set token details before starting the cycle.")
+            chain = getattr(self, 'connected_chain', None) or (self.token_config.get('chain') if hasattr(self, 'token_config') else None)
+            
+            if not token_addr or not chain:
+                await self.safe_edit_text(status_msg, "❌ No valid token connected. Please use /connect to set token details.")
                 return
+                
+            # Chain-specific validation
+            if chain in {'BNB', 'ETH'}:
+                if not (str(token_addr).startswith('0x') and len(str(token_addr)) == 42):
+                    await self.safe_edit_text(status_msg, 
+                        "❌ Invalid EVM token address.\n\n"
+                        "• Must start with 0x\n"
+                        "• Must be 42 characters long\n\n"
+                        "Please check and try again with a valid address."
+                    )
+                    return
+            elif chain == 'SOL':
+                if str(token_addr).startswith('0x') or not (32 <= len(str(token_addr)) <= 48):
+                    await self.safe_edit_text(status_msg,
+                        "❌ Invalid Solana token address.\n\n"
+                        "• Must be in base58 format\n"
+                        "• Must be between 32-48 characters\n"
+                        "• No '0x' prefix needed\n\n"
+                        "Please verify and try again."
+                    )
+                    return
 
-            # Pre-flight: require funded wallets
+            # 2. Wallet funding check (gracefully handle missing cache by scanning all wallets)
+            await self.safe_edit_text(status_msg, "🔍 Checking wallet funding status...")
             funded = getattr(self, 'funded_wallets', []) or []
+            scanning_all = False
             if not funded:
-                await self.safe_reply_text(update, "❌ No funded wallets available. Use /start_funding first.")
+                # No cached funded list; fall back to all loaded wallets so we can detect
+                # manually funded wallets on-chain.
+                candidate_wallets = self.wallets if isinstance(self.wallets, list) else []
+                if not candidate_wallets:
+                    await self.safe_edit_text(
+                        status_msg,
+                        "❌ No wallets loaded.\n\n"
+                        "Please create or load wallets with /create_wallet first."
+                    )
+                    return
+                await self.safe_edit_text(
+                    status_msg,
+                    "ℹ️ No cached funded list found. Scanning all wallets for balances..."
+                )
+                funded = candidate_wallets
+                scanning_all = True
+
+            # 3. Wallet balance verification with detailed feedback
+            w3 = self.get_web3_for_chain(chain)
+            min_balance = 0.00085  # Minimum native token required per wallet (aligned with TradingCycle)
+            # If we're scanning all wallets (no cached funded list), expand the limit to include all
+            max_wallets_to_check = len(funded) if scanning_all else 20
+            
+            working_wallets = []
+            total_balance = 0.0
+            
+            # Check wallet balances in batches with progress updates
+            wallets_to_check = funded[:max_wallets_to_check]
+            total_wallets = len(wallets_to_check)
+            
+            for i, wallet in enumerate(wallets_to_check, 1):
+                try:
+                    # Extract wallet address
+                    wallet_addr = wallet.get('address', '').strip() if isinstance(wallet, dict) else str(wallet).strip()
+                    if not wallet_addr:
+                        continue
+                    
+                    # Update status every 3 wallets or on last wallet
+                    if i % 3 == 1 or i == total_wallets:
+                        progress = f"({i}/{total_wallets})"
+                        balance_info = f"• Found {len(working_wallets)} funded wallets"
+                        if working_wallets:
+                            balance_info += f" with {total_balance:.4f} {chain} total"
+                        await self.safe_edit_text(
+                            status_msg,
+                            f"🔍 Checking wallet balances {progress}...\n"
+                            f"{balance_info}\n"
+                            "⏳ This may take a moment..."
+                        )
+                    
+                    # Get balance with retry logic
+                    balance_wei = await self._get_balance_with_retry(w3, wallet_addr)
+                    balance = float(w3.from_wei(balance_wei, 'ether'))
+                    
+                    if balance >= min_balance:
+                        working_wallets.append({
+                            'address': wallet_addr,
+                            'balance': balance,
+                            'private_key': wallet.get('private_key') if isinstance(wallet, dict) else None
+                        })
+                        total_balance += balance
+                        
+                        self.logger.info(
+                            f"✅ Wallet {wallet_addr[:8]}...{wallet_addr[-6:]} "
+                            f"has {balance:.6f} {chain} (≥ {min_balance} required)"
+                        )
+                    else:
+                        self.logger.warning(
+                            f"⚠️  Wallet {wallet_addr[:8]}...{wallet_addr[-6:]} "
+                            f"has insufficient balance: {balance:.6f} {chain} "
+                            f"(needs {min_balance} {chain})"
+                        )
+                        
+                except Exception as e:
+                    self.logger.error(f"❌ Error checking wallet {i}: {str(e)}", exc_info=True)
+                    continue
+            
+            # Process results
+            if not working_wallets:
+                await self.safe_edit_text(
+                    status_msg,
+                    "❌ No wallets with sufficient balance found.\n\n"
+                    f"• Minimum required: {min_balance} {chain} per wallet\n"
+                    f"• Wallets checked: {total_wallets}\n\n"
+                    "Please fund your wallets using /start_funding and try again."
+                )
                 return
+            
+            # 4. Prepare final wallet list
+            working_wallets.sort(key=lambda x: x['balance'], reverse=True)
+            
+            # Limit to top 20 wallets by balance to prevent excessive gas usage
+            if len(working_wallets) > 20:
+                working_wallets = working_wallets[:20]
+                total_balance = sum(w['balance'] for w in working_wallets)
+                
+            # Update instance state
+            self.funded_wallets = working_wallets
+            
+            # Show wallet summary before proceeding (Option A formatting)
+            bullet_lines = []
+            for w in working_wallets[:5]:
+                addr = w['address']
+                bullet_lines.append(f"• <code>{addr[:6]}...{addr[-4:]}</code> — {w['balance']:.4f} {chain}")
+            more = f"\n• ...and {len(working_wallets) - 5} more wallets" if len(working_wallets) > 5 else ''
+            preflight_text = (
+                f"✅ <b>Found {len(working_wallets)} funded wallets</b> (≥ 0.00085 {chain})\n"
+                f"💼 <b>Total balance:</b> {total_balance:.4f} {chain}\n\n"
+                f"📋 <b>Wallet summary</b>:\n" + "\n".join(bullet_lines) + more + "\n\n"
+                "🔄 Initializing trading cycle..."
+            )
+            await self.safe_edit_text(status_msg, preflight_text, parse_mode='HTML')
 
-            # Ensure trading_cycle exists and token is in sync
-            if not hasattr(self, 'trading_cycle') or not self.trading_cycle:
-                self.trading_cycle = TradingCycle(wallet_manager=self, web3=self.web3, token_address=token_addr)
-            else:
-                self.trading_cycle.token_address = token_addr
-
-            # Map funded wallets into the trading cycle structure if needed
-            # Expecting wallets as list of dicts with 'address' and 'private_key'
+            # 5. Initialize trading cycle with validated wallets
             try:
-                self.trading_cycle.wallets = [
-                    { 'address': w, 'private_key': self.wallet_private_keys[w] } if isinstance(w, str) else w
-                    for w in funded
-                ]
-            except Exception:
-                # If structure already correct, keep as-is
-                self.trading_cycle.wallets = funded
+                # Ensure trading_cycle exists and token is in sync (chain-aware)
+                if not hasattr(self, 'trading_cycle') or not self.trading_cycle:
+                    if chain in {'BNB', 'ETH'}:
+                        w3 = self.get_web3_for_chain(chain)
+                        self.trading_cycle = TradingCycle(
+                            wallet_manager=self, 
+                            web3=w3, 
+                            token_address=token_addr, 
+                            chain=chain
+                        )
+                    elif chain == 'SOL':
+                        if SolanaTradingCycle is None:
+                            raise ImportError("SOL trading engine not available. Missing module.")
+                        client = self.get_solana_client()
+                        self.trading_cycle = SolanaTradingCycle(
+                            wallet_manager=self, 
+                            client=client, 
+                            token_address=token_addr
+                        )
+                    else:
+                        raise ValueError(f"Unsupported chain: {chain}")
+                else:
+                    # Update existing trading cycle with new token address
+                    self.trading_cycle.token_address = token_addr
 
-            # Start the cycle
-            msg = await self.trading_cycle.start()
-            await self.safe_reply_text(update, msg)
+                # 6. Prepare wallet data for trading cycle
+                try:
+                    # Ensure we have private keys for all working wallets
+                    for wallet in working_wallets:
+                        if 'private_key' not in wallet or not wallet['private_key']:
+                            wallet['private_key'] = self.wallet_private_keys.get(wallet['address'])
+                    
+                    # Update trading cycle with validated wallets
+                    self.trading_cycle.wallets = working_wallets
+                    
+                    # Start the trading cycle
+                    start_msg = await self.trading_cycle.start()
+                    
+                    # Final success message
+                    await self.safe_edit_text(
+                        status_msg,
+                        f"🚀 Trading cycle started successfully!\n\n"
+                        f"• Token: {token_addr}\n"
+                        f"• Chain: {chain}\n"
+                        f"• Wallets: {len(working_wallets)} ready\n"
+                        f"• Total balance: {total_balance:.4f} {chain}\n\n"
+                        f"{start_msg}\n\n"
+                        "Use /stop_trend to stop the trading cycle."
+                    )
+                    
+                except Exception as e:
+                    self.logger.error(f"Error initializing trading cycle: {str(e)}", exc_info=True)
+                    raise Exception(f"Failed to initialize trading cycle: {str(e)}")
+                    
+            except ImportError as ie:
+                await self.safe_edit_text(
+                    status_msg,
+                    f"❌ {str(ie)}\n\n"
+                    "Please install the required dependencies and try again."
+                )
+                return
+                
+            except Exception as e:
+                self.logger.error(f"Error in trading cycle setup: {str(e)}", exc_info=True)
+                await self.safe_edit_text(
+                    status_msg,
+                    f"❌ Failed to start trading cycle.\n\n"
+                    f"Error: {str(e)}\n\n"
+                    "Please check the logs for more details and try again."
+                )
+                return
+                
         except Exception as e:
-            self.logger.error(f"Error in start_trend: {str(e)}", exc_info=True)
-            await self.safe_reply_text(update, "❌ Failed to start trend. Please try again later.")
+            self.logger.error(f"Critical error in start_trend: {str(e)}", exc_info=True)
+            try:
+                await self.safe_edit_text(
+                    status_msg,
+                    "❌ A critical error occurred while starting the trend.\n\n"
+                    "Please check the logs and try again. If the issue persists, "
+                    "contact support with the error details."
+                )
+            except:
+                # Fallback in case status_msg is not available
+                await self.safe_reply_text(
+                    update,
+                    "❌ A critical error occurred. Please check the logs and try again."
+                )
 
     async def stop_trend(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Stop trading/trending. Placeholder implementation to satisfy handler."""

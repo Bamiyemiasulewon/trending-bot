@@ -283,7 +283,7 @@ class DEXTrader:
             
             # Send the transaction
             tx_hash = self.wallet_manager.w3.eth.send_raw_transaction(
-                signed_tx.rawTransaction
+                signed_tx.raw_transaction
             ).hex()
             
             # Wait for transaction receipt
