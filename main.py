@@ -37,9 +37,9 @@ class TokenTrendingBot:
         # Load environment variables from project root .env file
         env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
         if os.path.exists(env_path):
-            load_dotenv(env_path)
+            load_dotenv(env_path, override=True)
         else:
-            load_dotenv()  # Fallback to default .env location
+            load_dotenv(override=True)  # Fallback to default .env location
             
         self.token = os.getenv("TELEGRAM_TOKEN")
         if not self.token:
@@ -578,14 +578,6 @@ class TokenTrendingBot:
             'https://bsc.publicnode.com',
             'https://rpc.ankr.com/bsc',
             'https://1rpc.io/bnb',
-            'https://bsc-dataseed1.bnbchain.org',
-            'https://bsc-dataseed.binance.org/',
-            'https://bsc-dataseed1.binance.org/',
-            'https://bsc-dataseed2.binance.org',
-            'https://bsc-dataseed3.binance.org',
-            'https://bsc-dataseed4.binance.org',
-            'https://bsc-dataseed1.defibit.io',
-            'https://bsc-dataseed2.defibit.io',
             'https://endpoints.omniatech.io/v1/bsc/mainnet/public',
         ]
         # Remove Nones/empties and dedupe while preserving order
@@ -649,9 +641,9 @@ class TokenTrendingBot:
         # Load environment variables from project root .env file
         env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
         if os.path.exists(env_path):
-            load_dotenv(env_path)
+            load_dotenv(env_path, override=True)
         else:
-            load_dotenv()  # Fallback to default .env location
+            load_dotenv(override=True)  # Fallback to default .env location
             
         self.token = os.getenv("TELEGRAM_TOKEN")
         if not self.token:
@@ -726,6 +718,9 @@ class TokenTrendingBot:
             filters.TEXT & ~filters.COMMAND,
             self.handle_interactive_messages
         ))
+        
+        # Initialize connected_chain from config
+        self.connected_chain = (self.token_config.get('chain') or '').upper() or None
         
         # Initialize central wallet with validation
         self.central_wallet_address = os.getenv('CENTRAL_WALLET_ADDRESS', '').strip()

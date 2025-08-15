@@ -24,7 +24,7 @@ TOP_UP_AMOUNT = Decimal(os.getenv('TOP_UP_AMOUNT', '0.05'))
 
 # ===== TRADING CONFIGURATION =====
 # Default token to trade (BNB token address)
-DEFAULT_TOKEN_ADDRESS = os.getenv('DEFAULT_TOKEN_ADDRESS', '')
+DEFAULT_TOKEN_ADDRESS = os.getenv('DEFAULT_TOKEN_ADDRESS', '0x32B407ee915432Be6D3F168bc1eFf2a6F8b2034C')  # HODL Token
 
 # Trading pairs (token_address: router_address)
 TOKEN_PAIRS = {

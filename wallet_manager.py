@@ -11,6 +11,14 @@ from web3 import Web3, HTTPProvider
 from eth_account import Account
 from eth_abi import encode_abi
 from hexbytes import HexBytes
+from dotenv import load_dotenv
+
+# Load environment variables from project root .env if present
+_ENV_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
+if os.path.exists(_ENV_PATH):
+    load_dotenv(_ENV_PATH)
+else:
+    load_dotenv()
 
 from trading_config import (
     MIN_WALLET_BALANCE,
@@ -30,12 +38,15 @@ class WalletManager:
         self.load_wallets()
         
         # Initialize Web3
-        self.rpc_url = rpc_url or os.getenv('BSC_MAINNET_RPC')
-        if not self.rpc_url:
-            raise ValueError("BSC_MAINNET_RPC not found in environment variables")
-            
+        self.rpc_url = rpc_url or os.getenv('BSC_MAINNET_RPC') or 'https://bsc.publicnode.com'
+        
         self.w3 = Web3(HTTPProvider(self.rpc_url))
-        self.w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+        # Inject POA middleware when available; ignore if already handled by web3
+        try:
+            from web3.middleware import geth_poa_middleware  # type: ignore
+            self.w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+        except Exception:
+            pass
         
         # Load PancakeSwap Router ABI
         with open(os.path.join(os.path.dirname(__file__), 'pancakeswap_router_abi.json')) as f:

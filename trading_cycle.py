@@ -9,6 +9,9 @@ from typing import Dict, List, Tuple, Optional
 from decimal import Decimal
 from web3 import Web3
 from web3.types import TxReceipt
+from dotenv import load_dotenv
+
+load_dotenv()
 
 class TradingCycle:
     def __init__(self, wallet_manager, web3: Web3, token_address: str, chain: str = 'BNB'):
@@ -27,11 +30,23 @@ class TradingCycle:
         self.min_wallet_balance = 0.00085  # slightly less than 0.001 BNB/ETH/SOL
         
         # Base buy ranges (native) and current scaled values (tuned for tiny balances)
-        self.base_min_buy_wei = Web3.to_wei(0.0002, 'ether')  # 0.0002 native
-        self.base_max_buy_wei = Web3.to_wei(0.0004, 'ether')  # 0.0004 native
+        env_min_buy_wei = os.getenv('BASE_MIN_BUY_WEI')
+        env_max_buy_wei = os.getenv('BASE_MAX_BUY_WEI')
+        try:
+            self.base_min_buy_wei = int(env_min_buy_wei) if env_min_buy_wei else Web3.to_wei(0.0002, 'ether')
+        except Exception:
+            self.base_min_buy_wei = Web3.to_wei(0.0002, 'ether')
+        try:
+            self.base_max_buy_wei = int(env_max_buy_wei) if env_max_buy_wei else Web3.to_wei(0.0004, 'ether')
+        except Exception:
+            self.base_max_buy_wei = Web3.to_wei(0.0004, 'ether')
         self.min_buy_amount = int(self.base_min_buy_wei)
         self.max_buy_amount = int(self.base_max_buy_wei)
-        self.gas_buffer = 0.0001  # Smaller buffer for gas in native
+        # Gas buffer in native units (float), overridable via env GAS_BUFFER
+        try:
+            self.gas_buffer = float(os.getenv('GAS_BUFFER', '0.0001'))
+        except Exception:
+            self.gas_buffer = 0.0001
         self.max_trades_per_wallet = 15  # buy + sell combined (per day)
         self.trade_counts = {}  # legacy total counter (kept for compatibility)
         self.trade_counts_today = {}  # address -> int (per UTC day)
@@ -83,6 +98,44 @@ class TradingCycle:
             self.stable2_address_raw = '0x55d398326f99059fF775485246999027B3197955'  # USDT
 
         self.load_abis()
+        
+        # Initialize token contract
+        if not self.web3.is_address(self.token_address):
+            raise ValueError(f"Invalid token address: {self.token_address}")
+        self.token_address = self.web3.to_checksum_address(self.token_address)
+        self.token_contract = self.web3.eth.contract(
+            address=self.token_address,
+            abi=self.token_abi
+        )
+        
+        # Verify token contract has required methods and is tradable
+        try:
+            # Check basic token functions
+            self.token_contract.functions.balanceOf(self.token_address).call()
+            decimals = self.token_contract.functions.decimals().call()
+            symbol = self.token_contract.functions.symbol().call()
+            
+            # Check if token has liquidity by trying to get a quote
+            paths = self._candidate_paths(self.token_address)
+            logging.info(f"Checking liquidity for {symbol} ({self.token_address})...")
+            
+            # Try to get a quote with minimal amount
+            test_amount = 1  # Smallest possible amount
+            test_quote, _ = self._best_out_quote(test_amount, paths)
+            
+            if not test_quote or test_quote == 0:
+                raise ValueError(f"No liquidity found for token {symbol} - cannot trade")
+                
+            logging.info(f"Token {symbol} has sufficient liquidity")
+            
+        except Exception as e:
+            raise ValueError(f"Token contract validation failed: {str(e)}")
+            
+        # Initialize router contract
+        self.router_contract = self.web3.eth.contract(
+            address=self.router_address,
+            abi=self.router_abi
+        )
 
     def load_abis(self):
         """Load ABIs for token and router contracts"""
@@ -375,8 +428,11 @@ class TradingCycle:
     # --- Routing and quoting helpers ---
     def _candidate_paths(self, token: str):
         token = self.web3.to_checksum_address(token)
+        # Try direct path first, then through stables if needed
         return [
-            [self.wbnb_address, token],
+            [self.wbnb_address, token],  # Direct path WBNB -> TOKEN
+            [self.wbnb_address, self.busd_address, token],  # WBNB -> BUSD -> TOKEN
+            [self.wbnb_address, self.usdt_address, token],  # WBNB -> USDT -> TOKEN
             [self.wbnb_address, self.usdt_address, token],
             [self.wbnb_address, self.busd_address, token],
         ]
@@ -394,12 +450,21 @@ class TradingCycle:
         best_path = None
         for path in path_list:
             try:
-                amounts = self.router_contract.functions.getAmountsOut(int(amount_in_wei), path).call()
-                out_amt = int(amounts[-1])
-                if out_amt > 0 and (best is None or out_amt > best):
-                    best = out_amt
+                quoted_out = self.router_contract.functions.getAmountsOut(
+                    amount_in_wei,
+                    path
+                ).call()[-1]  # last element is the output amount
+                
+                logging.info(f"Quote for path {[self.web3.to_checksum_address(addr) for addr in path]} "
+                           f"with {amount_in_wei} wei: {quoted_out} tokens")
+                
+                if quoted_out > 0 and (best is None or quoted_out > best):
+                    best = quoted_out
                     best_path = path
-            except Exception:
+                    logging.info(f"New best quote: {best} tokens via path {[self.web3.to_checksum_address(addr) for addr in best_path]}")
+                    
+            except Exception as e:
+                logging.warning(f"Quote failed for path {[self.web3.to_checksum_address(addr) for addr in path]}: {str(e)}")
                 continue
         return best, best_path
 
@@ -409,16 +474,91 @@ class TradingCycle:
 
     async def _buy_tokens(self, wallet: Dict, amount_wei: int) -> Optional[TxReceipt]:
         """Execute a buy with path discovery, safe minOut, gas estimate, and retries."""
+        if not self.token_contract or not self.router_contract:
+            logging.error("Token or router contract not initialized")
+            return None
+            
+        # Log token info for debugging
+        try:
+            symbol = self.token_contract.functions.symbol().call()
+            logging.info(f"Attempting to buy {symbol} (0x{self.token_address[-4:]}) for wallet {wallet['address'][:6]}...{wallet['address'][-4:]}")
+        except:
+            logging.warning(f"Could not get token symbol for {self.token_address}")
+            
         acct = self.web3.eth.account.from_key(wallet['private_key'])
         from_addr = self.web3.to_checksum_address(acct.address)
+        
+        # Verify token contract is valid and has liquidity
+        try:
+            token_balance = self.token_contract.functions.balanceOf(from_addr).call()
+            token_decimals = self.token_contract.functions.decimals().call()
+            token_symbol = self.token_contract.functions.symbol().call()
+            logging.info(f"Token contract verified. Symbol: {token_symbol}, Decimals: {token_decimals}, Balance: {token_balance}")
+            
+            # Check if token has liquidity by trying to get a quote
+            paths = self._candidate_paths(self.token_address)
+            path_descriptions = []
+            for path in paths:
+                path_desc = []
+                for addr in path:
+                    try:
+                        if addr.lower() == self.wbnb_address.lower():
+                            path_desc.append('WBNB')
+                        elif addr.lower() == self.busd_address.lower():
+                            path_desc.append('BUSD')
+                        elif addr.lower() == self.usdt_address.lower():
+                            path_desc.append('USDT')
+                        else:
+                            path_desc.append(addr[:6] + '...' + addr[-4:])
+                    except:
+                        path_desc.append(addr[:6] + '...' + addr[-4:])
+                path_descriptions.append(' → '.join(path_desc))
+            
+            logging.info(f"Checking trading paths:\n" + '\n'.join([f"  {i+1}. {path}" for i, path in enumerate(path_descriptions)]))
+            
+            # Check if any path returns a valid quote with minimal amount (1 wei)
+            test_quote, best_path = self._best_out_quote(1, paths)
+            if not test_quote or test_quote == 0:
+                logging.error("❌ No valid trading path found. Possible reasons:")
+                logging.error("  1. Token has no liquidity on PancakeSwap V2")
+                logging.error("  2. Token is not paired with WBNB or supported stables")
+                logging.error("  3. Token contract has trading restrictions")
+                logging.error(f"  4. Token address might be incorrect: {self.token_address}")
+                return None
+                
+            logging.info(f"✅ Found valid trading path with quote: {test_quote} tokens per wei")
+                
+        except Exception as e:
+            logging.error(f"Token contract verification failed: {e}")
+            return None
         token = self.web3.to_checksum_address(self.token_address)
         # Balance check
         balance = self.web3.eth.get_balance(from_addr)
         gas_buf = Web3.to_wei(self.gas_buffer, 'ether')
         # Ensure we keep minimum native for future gas
-        if balance < amount_wei + gas_buf + self.min_native_balance_to_keep:
-            logging.warning(f"Insufficient BNB in {from_addr}")
+        required_floor = gas_buf + self.min_native_balance_to_keep
+        available = balance - required_floor
+        if available <= 0:
+            logging.warning(
+                f"Insufficient {self.chain} in {from_addr} — bal={self.web3.from_wei(balance,'ether'):.6f}, "
+                f"required_floor={self.web3.from_wei(required_floor,'ether'):.6f} (gas_buf+reserve)"
+            )
             return None
+        # If requested amount exceeds available, auto-scale it down (keeping 20% safety headroom)
+        if amount_wei > available:
+            scaled = int(max(self.base_min_buy_wei, available * 0.8))
+            if scaled < self.base_min_buy_wei:
+                logging.warning(
+                    f"Insufficient {self.chain} for min buy in {from_addr} — bal={self.web3.from_wei(balance,'ether'):.6f}, "
+                    f"min_buy={self.web3.from_wei(self.base_min_buy_wei,'ether'):.6f}, "
+                    f"required_floor={self.web3.from_wei(required_floor,'ether'):.6f}"
+                )
+                return None
+            logging.info(
+                f"Auto-scaling buy for {from_addr}: requested={self.web3.from_wei(amount_wei,'ether'):.6f} -> "
+                f"scaled={self.web3.from_wei(scaled,'ether'):.6f} (available={self.web3.from_wei(available,'ether'):.6f})"
+            )
+            amount_wei = scaled
         # Build swap parameters
         deadline = int(time.time()) + 120
         # Quote best path
@@ -509,6 +649,15 @@ class TradingCycle:
         if token_balance <= 0:
             logging.warning(f"No token balance to sell in {from_addr}")
             return None
+        # Ensure enough native gas balance to execute approval/sell
+        native_bal = self.web3.eth.get_balance(from_addr)
+        gas_buf = Web3.to_wei(self.gas_buffer, 'ether')
+        if native_bal < gas_buf:
+            logging.warning(
+                f"Insufficient {self.chain} gas for sell in {from_addr} — bal={self.web3.from_wei(native_bal,'ether'):.6f}, "
+                f"required_gas_buf={self.web3.from_wei(gas_buf,'ether'):.6f}"
+            )
+            return None
         # Sell a randomized fraction to avoid uniform behavior, dynamic range
         low = max(0.05, min(self.sell_frac_low, 0.95))
         high = max(low + 0.01, min(self.sell_frac_high, 0.98))
@@ -535,10 +684,15 @@ class TradingCycle:
             logging.info(f"Approve submitted {from_addr} -> tx {approve_hash.hex()}")
             self.web3.eth.wait_for_transaction_receipt(approve_hash)
         deadline = int(time.time()) + 120
-        # Quote best reverse path
+        # Quote best reverse path with simple auto-scale on failure
+        attempts = 0
         quoted_out, path = self._best_out_quote(int(amount_in), self._reverse_candidate_paths(token))
+        while (not path or not quoted_out) and attempts < 3 and amount_in > 1:
+            attempts += 1
+            amount_in = max(int(amount_in * 0.5), 1)
+            quoted_out, path = self._best_out_quote(int(amount_in), self._reverse_candidate_paths(token))
         if not path or not quoted_out:
-            logging.warning("No valid sell route/quote; skipping trade")
+            logging.warning("No valid sell route/quote after scaling; skipping trade")
             return None
         amount_out_min = self._min_out_with_slippage(quoted_out)
         # Retry loop
