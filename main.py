@@ -59,11 +59,16 @@ class TokenTrendingBot:
         )
         self.logger = logging.getLogger(__name__)
         
-        # Initialize BNB price cache
+        # Initialize native price cache (BNB/ETH)
+        self._price_cache = {
+            'BNB': {'price': 300.0, 'timestamp': 0, 'ttl': 300},
+            'ETH': {'price': 3000.0, 'timestamp': 0, 'ttl': 300},
+        }
+        # Back-compat for get_bnb_price()
         self._bnb_price_cache = {
-            'price': 300.0,  # Default fallback price
+            'price': self._price_cache['BNB']['price'],
             'timestamp': 0,
-            'ttl': 300  # 5 minutes in seconds
+            'ttl': 300
         }
         
         # Initialize Web3 connection
@@ -119,211 +124,63 @@ class TokenTrendingBot:
                 if os.path.exists(wallets_file_path):
                     self.logger.info(f"Wallet file exists, attempting to load...")
                     with open(wallets_file_path, 'r', encoding='utf-8') as f:
-                        wallets = json.load(f)
-                        self.logger.info(f"Successfully loaded wallet data, type: {type(wallets)}")
-                        if isinstance(wallets, list):
-                            # Normalize wallet objects to have address (private keys ignored for output)
-                            normalized = []
-                            for i, w in enumerate(wallets, 1):
-                                if not isinstance(w, dict):
-                                    self.logger.warning(f"Skipping non-dict wallet at index {i-1}")
-                                    continue
-                                addr = w.get('address') or w.get('addr')
-                                if addr:
-                                    normalized.append({"address": addr})
-                                else:
-                                    self.logger.warning(f"Wallet at index {i-1} has no valid address: {w}")
-                            
-                            self.wallets = normalized
-                            self.logger.info(f"Successfully loaded {len(self.wallets)} wallets from {wallets_file_path}")
-                            if self.wallets:
-                                self.logger.info(f"First wallet address: {self.wallets[0].get('address')}")
-                        else:
-                            self.logger.error(f"Wallet data is not a list: {type(wallets)}")
-                else:
-                    self.logger.error(f"Wallet file does not exist: {wallets_file_path}")
+                        data = json.load(f)
+                        # Normalize list of dicts {address, private_key?}
+                        self.wallets = data if isinstance(data, list) else []
+                        self.logger.info(f"Loaded {len(self.wallets)} wallets")
             except Exception as e:
-                self.logger.error(f"Error loading wallets on startup: {str(e)}", exc_info=True)
+                self.logger.error(f"Error loading wallets for chain {self.connected_chain}: {e}", exc_info=True)
 
-        # Register command handlers
-        self.app.add_handler(CommandHandler("start", self.start))
-        self.app.add_handler(CommandHandler("menu", self.menu))
-        self.app.add_handler(CommandHandler("create_wallet", self.create_wallet))
-        self.app.add_handler(CommandHandler("connect", self.connect_token))
-        self.app.add_handler(CommandHandler("fund_wallet", self.fund_wallet))
-        self.app.add_handler(CommandHandler("check_balance", self.check_balance))
-        self.app.add_handler(CommandHandler("wallet_status", self.wallet_status))
-        self.app.add_handler(CommandHandler("start_funding", self.start_funding))
-        self.app.add_handler(CommandHandler("refresh_funded", self.refresh_funded))
-        self.app.add_handler(CommandHandler("cancel", self.cancel))
-        self.app.add_handler(CommandHandler("start_trend", self.start_trend))
-        self.app.add_handler(CommandHandler("stop_trend", self.stop_trend))
-        
-        # Add message handler for interactive commands
-        self.app.add_handler(MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            self.handle_interactive_messages
-        ))
-        
-        # Global error handler to prevent crashes on transient network issues
-        self.app.add_error_handler(self.handle_application_error)
-        
-        # Initialize central wallets (BNB/ETH/SOL) from environment
-        self.central_wallets = {
-            'BNB': {
-                'address': os.getenv('BSC_CENTRAL_WALLET', '').strip(),
-                'private_key': os.getenv('BSC_CENTRAL_WALLET_KEY', '').strip(),
-            },
-            'ETH': {
-                'address': os.getenv('ETH_CENTRAL_WALLET', '').strip(),
-                'private_key': os.getenv('ETH_CENTRAL_WALLET_KEY', '').strip(),
-            },
-            'SOL': {
-                'address': os.getenv('SOL_CENTRAL_WALLET', '').strip(),
-                'private_key': os.getenv('SOL_CENTRAL_WALLET_KEY', '').strip(),
-            },
-        }
-        # Backward compatibility with single-chain BNB setup
-        legacy_addr = os.getenv('CENTRAL_WALLET_ADDRESS', '').strip()
-        legacy_key = os.getenv('CENTRAL_WALLET_PRIVATE_KEY', '').strip()
-        if legacy_addr and not self.central_wallets['BNB']['address']:
-            self.central_wallets['BNB']['address'] = legacy_addr
-        if legacy_key and not self.central_wallets['BNB']['private_key']:
-            self.central_wallets['BNB']['private_key'] = legacy_key
-
-        # Validate EVM central wallet addresses when possible
+    # ---- Helpers for USD-based min wallet balance ----
+    def _get_env_min_wallet_balance_usd(self) -> float:
         try:
-            if self.web3 and self.central_wallets['BNB']['address']:
-                if self.web3.is_address(self.central_wallets['BNB']['address']):
-                    self.central_wallets['BNB']['address'] = self.web3.to_checksum_address(self.central_wallets['BNB']['address'])
-        
-            # For ETH, reuse web3 if already connected to BSC; checksum still valid
-            if self.web3 and self.central_wallets['ETH']['address'] and self.web3.is_address(self.central_wallets['ETH']['address']):
-                self.central_wallets['ETH']['address'] = self.web3.to_checksum_address(self.central_wallets['ETH']['address'])
+            return float(os.getenv('MIN_WALLET_BALANCE_USD', '0') or 0)
+        except Exception:
+            return 0.0
+
+    def _coingecko_id_for_chain(self, chain: str) -> str:
+        ch = (chain or 'BNB').upper()
+        return 'binancecoin' if ch == 'BNB' else 'ethereum'
+
+    async def _fetch_native_price_usd(self, chain: str) -> float:
+        try:
+            # Simple no-auth fetch with tiny caching via self._price_cache
+            ch = (chain or 'BNB').upper()
+            cache = self._price_cache.get(ch, {'price': 0.0, 'timestamp': 0, 'ttl': 300})
+            now = int(time.time())
+            if cache and cache.get('price') and now - int(cache.get('timestamp', 0)) < int(cache.get('ttl', 300)):
+                return float(cache['price'])
+            cid = self._coingecko_id_for_chain(chain)
+            resp = requests.get(
+                'https://api.coingecko.com/api/v3/simple/price',
+                params={'ids': cid, 'vs_currencies': 'usd'},
+                timeout=5
+            )
+            data = resp.json()
+            price = float(data.get(cid, {}).get('usd', 0) or 0)
+            if price > 0:
+                self._price_cache[ch] = {'price': price, 'timestamp': now, 'ttl': 300}
+                return price
         except Exception as e:
-            self.logger.warning(f"Central wallet validation warning: {e}")
+            self.logger.warning(f"Price fetch failed: {e}")
+        # fallback to previous cache or 0
+        try:
+            return float(self._price_cache.get((chain or 'BNB').upper(), {}).get('price', 0) or 0)
+        except Exception:
+            return 0.0
 
-        # Convenience properties for existing BNB-only flows
-        self.central_wallet_address = self.central_wallets.get('BNB', {}).get('address', '')
-        self.central_wallet_private_key = self.central_wallets.get('BNB', {}).get('private_key', '')
-
-    def get_central_wallet(self, chain: str):
-        """Return central wallet dict for chain: keys address/private_key.
-        Lazily initializes from environment if not already present to avoid AttributeError
-        when older __init__ path is executed.
+    async def _compute_min_required_native(self, chain: str) -> tuple[float, str]:
+        """Compute min required native balance, considering USD env threshold.
+        Returns (min_native, thresh_text) where thresh_text may include USD.
         """
-        if not hasattr(self, 'central_wallets') or not isinstance(getattr(self, 'central_wallets'), dict):
-            # Initialize from environment
-            self.central_wallets = {
-                'BNB': {
-                    'address': os.getenv('BSC_CENTRAL_WALLET', '').strip(),
-                    'private_key': os.getenv('BSC_CENTRAL_WALLET_KEY', '').strip(),
-                },
-                'ETH': {
-                    'address': os.getenv('ETH_CENTRAL_WALLET', '').strip(),
-                    'private_key': os.getenv('ETH_CENTRAL_WALLET_KEY', '').strip(),
-                },
-                'SOL': {
-                    'address': os.getenv('SOL_CENTRAL_WALLET', '').strip(),
-                    'private_key': os.getenv('SOL_CENTRAL_WALLET_KEY', '').strip(),
-                },
-            }
-            # Backward compatibility legacy keys for BNB
-            legacy_addr = os.getenv('CENTRAL_WALLET_ADDRESS', '').strip()
-            legacy_key = os.getenv('CENTRAL_WALLET_PRIVATE_KEY', '').strip()
-            if legacy_addr and not self.central_wallets['BNB']['address']:
-                self.central_wallets['BNB']['address'] = legacy_addr
-            if legacy_key and not self.central_wallets['BNB']['private_key']:
-                self.central_wallets['BNB']['private_key'] = legacy_key
-        return self.central_wallets.get((chain or '').upper(), {})
-
-    def moralis_trending(self, chain: str):
-        """Fetch trending tokens via Moralis for given chain: BNB(bsc), ETH(eth), SOL(solana)."""
-        chain_map = {'BNB': 'bsc', 'ETH': 'eth', 'SOL': 'solana'}
-        chain_id = chain_map.get((chain or '').upper())
-        if not chain_id:
-            raise ValueError(f"Unsupported chain: {chain}")
-        api_key = os.getenv('MORALIS_API_KEY', '').strip()
-        if not api_key:
-            raise RuntimeError("MORALIS_API_KEY not set in environment")
-        url = f"https://deep-index.moralis.io/api/v2.2/market/trending/tokens?chain={chain_id}"
-        headers = {"X-API-Key": api_key}
-        resp = requests.get(url, headers=headers, timeout=20)
-        resp.raise_for_status()
-        return resp.json()
-
-    def detect_chain_from_address(self, token_address: str) -> str | None:
-        """Heuristically detect chain from address.
-        - If starts with 0x and len 42: try BNB then ETH via eth_getCode; pick the one with non-empty code; if both empty, return None.
-        - Else if looks like base58 (no 0x, length 32-48): SOL.
-        Returns 'BNB' | 'ETH' | 'SOL' | None
-        """
-        if not token_address:
-            return None
-        addr = token_address.strip()
-        # SOL pattern
-        if not addr.startswith('0x') and 32 <= len(addr) <= 48:
-            return 'SOL'
-        # EVM pattern
-        if addr.startswith('0x') and len(addr) == 42:
-            # Try BNB first
-            try:
-                w3_bnb = self.get_web3_for_chain('BNB')
-                if w3_bnb.is_address(addr):
-                    code = w3_bnb.eth.get_code(w3_bnb.to_checksum_address(addr))
-                    if code and len(code) > 2:
-                        return 'BNB'
-            except Exception:
-                pass
-            # Then ETH
-            try:
-                w3_eth = self.get_web3_for_chain('ETH')
-                if w3_eth.is_address(addr):
-                    code = w3_eth.eth.get_code(w3_eth.to_checksum_address(addr))
-                    if code and len(code) > 2:
-                        return 'ETH'
-            except Exception:
-                pass
-            # Ambiguous EVM: neither BNB nor ETH has code at this address -> require explicit chain
-            return None
-        return None
-
-    def get_web3_for_chain(self, chain: str) -> Web3:
-        """Return a Web3 connected to the given EVM chain (ETH or BNB)."""
-        chain = (chain or '').upper()
-        if chain == 'ETH':
-            eth_rpc = (os.getenv('ETH_MAINNET_RPC') or os.getenv('INFURA_ETH_MAINNET') or '').strip()
-            if not eth_rpc:
-                # Common Infura pattern; user should set ETH_MAINNET_RPC instead
-                project = os.getenv('INFURA_PROJECT_ID', '').strip()
-                if project:
-                    eth_rpc = f"https://mainnet.infura.io/v3/{project}"
-            if not eth_rpc:
-                raise RuntimeError('No ETH_MAINNET_RPC configured')
-            return Web3(HTTPProvider(eth_rpc, request_kwargs={'timeout': 10}))
-        if chain == 'BNB':
-            bsc_rpc = (os.getenv('BSC_MAINNET_RPC') or '').strip() or 'https://bsc.publicnode.com'
-            return Web3(HTTPProvider(bsc_rpc, request_kwargs={'timeout': 10}))
-        raise ValueError(f'Unsupported EVM chain: {chain}')
-
-    def get_solana_client(self) -> SolClient:
-        url = (os.getenv('SOLANA_MAINNET_RPC') or 'https://api.mainnet-beta.solana.com').strip()
-        return SolClient(url)
-
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Sends a welcome message when the /start command is issued."""
-        user = update.effective_user
-        name = (getattr(user, 'first_name', None) or getattr(user, 'full_name', None) or 'there').strip()
-        await self.safe_reply_text(
-            update,
-            (
-                f"👋 Hey {name}!\n\n"
-                "🤖 <b>Welcome to TrendingBot</b>\n"
-                "Manage wallets, connect tokens, and start trending cycles.\n\n"
-                "Use <b>/menu</b> to see available commands."
-            ),
-            parse_mode='HTML'
-        )
+        fallback = 0.00085
+        usd = self._get_env_min_wallet_balance_usd()
+        if usd and usd > 0:
+            price = await self._fetch_native_price_usd(chain)
+            if price and price > 0:
+                native = max(fallback, float(usd) / float(price))
+                return native, f"{native:.6f} {chain} (~${usd:.2f})"
+        return fallback, f"{fallback:.6f} {chain}"
 
     def load_token_config(self):
         """Load token configuration from file if it exists."""
@@ -366,28 +223,61 @@ class TokenTrendingBot:
                 self.total_distributed_bnb = 0.0
 
     def save_token_config(self):
-        """Save token configuration to file."""
+        """Persist token_config, including funded_wallets and totals, to token_config.json"""
         try:
-            # Ensure all current state is saved to token_config
-            if hasattr(self, 'funded_wallets'):
-                self.token_config['funded_wallets'] = self.funded_wallets
-            if hasattr(self, 'total_distributed_bnb'):
-                self.token_config['total_distributed_bnb'] = self.total_distributed_bnb
-                
             config_path = os.path.join(os.path.dirname(__file__), 'token_config.json')
+            data = dict(self.token_config)
+            # Ensure runtime values are reflected
+            data['funded_wallets'] = getattr(self, 'funded_wallets', [])
+            data['total_distributed_bnb'] = float(getattr(self, 'total_distributed_bnb', 0.0) or 0.0)
             with open(config_path, 'w') as f:
-                json.dump(self.token_config, f, indent=4)
-                
-            self.logger.info(f"Saved token config: {len(self.funded_wallets)} funded wallets, {self.total_distributed_bnb} BNB distributed")
+                json.dump(data, f, indent=2)
         except Exception as e:
             self.logger.error(f"Error saving token config: {e}", exc_info=True)
+
+    async def _refresh_funded_from_chain(self, chain: str, min_balance: float | None = None, force: bool = False) -> list:
+        """Scan loaded wallets, compute balances, and refresh self.funded_wallets for EVM chains."""
+        if not isinstance(self.wallets, list) or not self.wallets:
+            return []
+        if getattr(self, 'funded_wallets', None) and not force:
+            return self.funded_wallets
+
+        chain = (chain or self.connected_chain or 'BNB').upper()
+        # Compute min threshold if not provided
+        if min_balance is None:
+            min_balance, _ = await self._compute_min_required_native(chain)
+        try:
+            w3 = self.get_web3_for_chain(chain)
+        except Exception as e:
+            self.logger.error(f"_refresh_funded_from_chain: get_web3 failed: {e}")
+            return []
+
+        detected = []
+        for w in self.wallets:
+            addr = (w.get('address') if isinstance(w, dict) else str(w)).strip()
+            if not addr:
+                continue
+            try:
+                # Prefer retry helper if available
+                try:
+                    wei = await self._get_balance_with_retry(w3, addr)
+                except Exception:
+                    wei = w3.eth.get_balance(addr)
+                bal = float(w3.from_wei(wei, 'ether'))
+                if bal >= float(min_balance):
+                    detected.append({'address': addr, 'balance': bal})
+            except Exception as e:
+                self.logger.debug(f"_refresh_funded_from_chain: skip {addr}: {e}")
+
+        detected.sort(key=lambda x: x['balance'], reverse=True)
+        self.funded_wallets = detected
+        return detected
 
     async def menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Displays the main menu of commands."""
         menu_text = (
             "📋 <b>Available Commands</b>\n\n"
             "🔹 /connect - Connect a token (format: <code>0x... CHAIN $TICKER</code>)\n"
-            "🔹 /create_wallet - Load wallets from wallets.json\n"
             f"🔹 {'⏸️' if self.trading_cycle and self.trading_cycle.is_running else '▶️'} /{'stop' if self.trading_cycle and self.trading_cycle.is_running else 'start'}_trend - {'Stop' if self.trading_cycle and self.trading_cycle.is_running else 'Start'} trending mode\n"
             "🔹 /refresh_funded - Rescan wallets on-chain to detect funded ones\n"
             "🔹 /menu - Display this menu\n\n"
@@ -415,14 +305,27 @@ class TokenTrendingBot:
                 funded_count = len(getattr(self, 'funded_wallets', []) or [])
                 group_a = len(self.wallets[:17])
                 group_b = len(self.wallets[17:34])
+                try:
+                    _, thresh_text = await self._compute_min_required_native(self.connected_chain or 'BNB')
+                except Exception:
+                    thresh_text = f"0.00085 {self.connected_chain or 'BNB'}"
                 menu_text += (
                     f"• Wallets: <b>{len(self.wallets)}</b> total (<b>{group_a}</b> in Group A, <b>{group_b}</b> in Group B)\n"
-                    f"• Funded (>= 0.00085 {self.connected_chain or 'BNB'}): <b>{funded_count}</b>"
+                    f"• Funded (≥ {thresh_text}): <b>{funded_count}</b>"
                 )
         else:
             menu_text += "No token connected. Use /connect to add one."
         
         await self.safe_reply_text(update, menu_text, parse_mode='HTML')
+
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Start handler: greets and shows menu."""
+        try:
+            await self.safe_reply_text(update, "👋 Welcome! Use /menu to see available commands.")
+            await self.menu(update, context)
+        except Exception as e:
+            self.logger.error(f"Error in /start: {e}", exc_info=True)
+            await self.safe_reply_text(update, "❌ Failed to display menu. Check logs.")
 
     async def connect_token(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start the token connection process."""
@@ -519,7 +422,8 @@ class TokenTrendingBot:
             self.token_address = token_address
             # Track connected chain for other features (e.g., /create_wallet)
             self.connected_chain = chain
-            
+            # Mark token as connected for this session
+            context.user_data['token_connected'] = True
             # Clear the state
             del context.user_data['awaiting_token_info']
             
@@ -636,6 +540,86 @@ class TokenTrendingBot:
             self.initialize_web3()
         return self.web3
 
+    # ---- Chain helpers (missing earlier) ----
+    def get_web3_for_chain(self, chain: str) -> Web3:
+        """Return a Web3 instance for the requested EVM chain.
+
+        - BNB: uses the initialized self.web3 (BSC).
+        - ETH: creates/caches a separate Web3 with env ETH_MAINNET_RPC or a public fallback.
+        """
+        ch = (chain or self.connected_chain or 'BNB').upper()
+        if ch == 'BNB':
+            return self.get_web3_instance()
+
+        if ch == 'ETH':
+            # Cache ETH client on first use
+            if not hasattr(self, '_web3_eth') or self._web3_eth is None:
+                rpc = (os.getenv('ETH_MAINNET_RPC') or '').strip() or 'https://eth.publicnode.com'
+                provider = HTTPProvider(rpc, request_kwargs={'timeout': 15})
+                w3 = Web3(provider)
+                # Light validation
+                _ = w3.eth.block_number  # raises if unhealthy
+                _ = w3.eth.gas_price
+                self._web3_eth = w3
+                self.logger.info("Connected ETH Web3 client")
+            return self._web3_eth
+
+        raise ValueError(f"Unsupported EVM chain requested: {ch}")
+
+    def detect_chain_from_address(self, address: str) -> str | None:
+        """Heuristically detect chain from token address format.
+
+        - 0x-prefixed, 42-char: EVM token. Default to current connected chain if it's BNB/ETH, else BNB.
+        - Non-0x, base58-like length 32-48: assume SOL.
+        """
+        if not address:
+            return None
+        addr = address.strip()
+        if addr.startswith('0x') and len(addr) == 42:
+            ch = (self.connected_chain or '').upper()
+            return ch if ch in {'BNB', 'ETH'} else 'BNB'
+        # Very loose SOL check by length (we already validate later)
+        if not addr.startswith('0x') and 32 <= len(addr) <= 48:
+            return 'SOL'
+        return None
+
+    def get_solana_client(self) -> SolClient:
+        """Return a Solana RPC client using env or public fallback."""
+        if not hasattr(self, '_sol_client') or self._sol_client is None:
+            rpc = (os.getenv('SOLANA_MAINNET_RPC') or '').strip() or 'https://api.mainnet-beta.solana.com'
+            self._sol_client = SolClient(rpc)
+        return self._sol_client
+
+    def get_central_wallet(self, chain: str) -> dict:
+        """Return the central wallet config for a given chain.
+
+        Looks for chain-specific env vars first, then falls back to legacy ones.
+        Returns a dict: { 'address': str, 'private_key': str }
+        """
+        ch = (chain or self.connected_chain or '').upper()
+        addr = ''
+        key = ''
+
+        if ch == 'BNB':
+            addr = os.getenv('BSC_CENTRAL_WALLET', '').strip()
+            key = os.getenv('BSC_CENTRAL_WALLET_KEY', '').strip()
+        elif ch == 'ETH':
+            addr = os.getenv('ETH_CENTRAL_WALLET', '').strip()
+            key = os.getenv('ETH_CENTRAL_WALLET_KEY', '').strip()
+        elif ch == 'SOL':
+            addr = os.getenv('SOL_CENTRAL_WALLET', '').strip()
+            key = os.getenv('SOL_CENTRAL_WALLET_KEY', '').strip()
+
+        # Legacy fallback for EVM chains
+        if (not addr or not key) and ch in {'BNB', 'ETH'}:
+            legacy_addr = os.getenv('CENTRAL_WALLET_ADDRESS', '').strip()
+            legacy_key = os.getenv('CENTRAL_WALLET_PRIVATE_KEY', '').strip()
+            if legacy_addr and legacy_key:
+                addr = addr or legacy_addr
+                key = key or legacy_key
+
+        return {'address': addr, 'private_key': key}
+
     def __init__(self):
         """Initializes the bot, loads configuration, and sets up handlers."""
         # Load environment variables from project root .env file
@@ -670,11 +654,15 @@ class TokenTrendingBot:
         )
         self.logger = logging.getLogger(__name__)
         
-        # Initialize BNB price cache
+        # Initialize price caches
         self._bnb_price_cache = {
             'price': 300.0,  # Default fallback price
             'timestamp': 0,
             'ttl': 300  # 5 minutes in seconds
+        }
+        self._price_cache = {
+            'BNB': {'price': self._bnb_price_cache['price'], 'timestamp': 0, 'ttl': 300},
+            'ETH': {'price': 3000.0, 'timestamp': 0, 'ttl': 300},
         }
         
         # Simple and reliable Web3 connection
@@ -712,6 +700,8 @@ class TokenTrendingBot:
         self.app.add_handler(CommandHandler("cancel", self.cancel))
         self.app.add_handler(CommandHandler("start_trend", self.start_trend))
         self.app.add_handler(CommandHandler("stop_trend", self.stop_trend))
+        # Global error handler
+        self.app.add_error_handler(self.on_error)
         
         # Add message handler for interactive commands
         self.app.add_handler(MessageHandler(
@@ -742,6 +732,18 @@ class TokenTrendingBot:
                 self.logger.error(f"Error validating central wallet: {str(e)}")
                 self.central_wallet_address = ''
 
+    async def on_error(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Global error handler: log exception and notify user briefly."""
+        try:
+            self.logger.error("Unhandled exception", exc_info=context.error)
+            if update and getattr(update, 'effective_chat', None):
+                await self.safe_reply_text(
+                    update,
+                    "❌ An internal error occurred. It has been logged and will be addressed.")
+        except Exception:
+            # Avoid raising from error handler
+            pass
+
     async def _fetch_bnb_price_async(self, session, url, parser):
         """Helper method to fetch BNB price asynchronously"""
         try:
@@ -769,12 +771,12 @@ class TokenTrendingBot:
         self.logger.error(f"Failed to get balance for {address} after {max_retries} attempts: {str(last_error)}")
         raise last_error
 
-    async def _refresh_funded_from_chain(self, chain: str, min_balance: float = 0.00085, force: bool = False) -> list:
+    async def _refresh_funded_from_chain(self, chain: str, min_balance: float | None = None, force: bool = False) -> list:
         """Scan all loaded wallets on-chain and refresh self.funded_wallets.
 
         Args:
             chain: 'BNB' | 'ETH' | 'SOL' (EVM chains supported for now)
-            min_balance: threshold to consider a wallet funded
+            min_balance: threshold to consider a wallet funded (native). If None, computed from USD env.
             force: if True, always rescan even if cache exists
 
         Returns: list of dicts: [{'address': str, 'balance': float}, ...]
@@ -787,12 +789,31 @@ class TokenTrendingBot:
         chain = (chain or self.connected_chain or 'BNB').upper()
         if chain not in {'BNB', 'ETH'}:
             # Only EVM scanning implemented here
-            return getattr(self, 'funded_wallets', []) or []
+            if isinstance(self.wallets, list) and self.wallets:
+                # Compute min threshold if not provided
+                if min_balance is None:
+                    min_balance, _ = await self._compute_min_required_native(chain)
+                try:
+                    w3 = self.get_web3_for_chain(chain)
+                except Exception as e:
+                    self.logger.error(f"_refresh_funded_from_chain: get_web3 failed: {e}")
+                    return []
+                detected = []
+                for w in self.wallets:
+                    addr = (w.get('address') if isinstance(w, dict) else str(w)).strip()
+                    if not addr:
+                        continue
+                    try:
+                        wei = w3.eth.get_balance(addr)
+                        bal = float(w3.from_wei(wei, 'ether'))
+                        if bal >= float(min_balance):
+                            detected.append({'address': addr, 'balance': bal})
+                    except Exception as e:
+                        self.logger.debug(f"_refresh_funded_from_chain: skip {addr}: {e}")
 
-        try:
-            w3 = self.get_web3_for_chain(chain)
-        except Exception as e:
-            self.logger.warning(f"_refresh_funded_from_chain: cannot init web3 for {chain}: {e}")
+                detected.sort(key=lambda x: x['balance'], reverse=True)
+                self.funded_wallets = detected
+                return detected
             return getattr(self, 'funded_wallets', []) or []
 
         detected = []
@@ -803,7 +824,7 @@ class TokenTrendingBot:
             try:
                 wei = await self._get_balance_with_retry(w3, addr)
                 bal = float(w3.from_wei(wei, 'ether'))
-                if bal >= min_balance:
+                if bal >= float(min_balance):
                     detected.append({'address': addr, 'balance': bal})
             except Exception as e:
                 self.logger.debug(f"_refresh_funded_from_chain: skip {addr}: {e}")
@@ -873,6 +894,14 @@ class TokenTrendingBot:
         return self._bnb_price_cache['price']
 
     async def fund_wallet(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # Enforce /connect in current session
+        if not context.user_data.get('token_connected', False):
+            await self.safe_reply_text(update, "❌ Please use /connect to set token details before using this command (required each session).")
+            return
+        # Enforce /connect in current session
+        if not context.user_data.get('token_connected', False):
+            await self.safe_reply_text(update, "❌ Please use /connect to set token details before using this command (required each session).")
+            return
         """Show the correct central wallet for the connected chain and its current balance."""
         try:
             chain = getattr(self, 'connected_chain', None) or self.token_config.get('chain')
@@ -964,6 +993,10 @@ class TokenTrendingBot:
         return text
 
     async def distribute_funds(self, update: Update, context: ContextTypes.DEFAULT_TYPE, funding_details: dict):
+        # Enforce /connect in current session
+        if not context.user_data.get('token_connected', False):
+            await self.safe_reply_text(update, "❌ Please use /connect to set token details before using this command (required each session).")
+            return
         """Distribute funds from central wallet to trading wallets based on available balance."""
         if not self.wallets:
             await self.safe_reply_text(update, "❌ No wallets found to fund.")
@@ -1267,6 +1300,11 @@ class TokenTrendingBot:
         return None
 
     async def create_wallet(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # Enforce /connect in current session
+        if not context.user_data.get('token_connected', False):
+            await self.safe_reply_text(update, "❌ Please use /connect to set token details before creating wallets (required each session).")
+            return
+
         """Reads pre-generated wallets for the connected chain and displays addresses only (one per line)."""
         # Determine connected chain
         chain = getattr(self, 'connected_chain', None) or self.token_config.get('chain')
@@ -1368,6 +1406,14 @@ class TokenTrendingBot:
             await self.safe_reply_text(update, "❌ An unexpected error occurred while processing wallets.")
 
     async def start_funding(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # Enforce /connect in current session
+        if not context.user_data.get('token_connected', False):
+            await self.safe_reply_text(update, "❌ Please use /connect to set token details before using this command (required each session).")
+            return
+        # Enforce /connect in current session
+        if not context.user_data.get('token_connected', False):
+            await self.safe_reply_text(update, "❌ Please use /connect to set token details before using this command (required each session).")
+            return
         """Start funding generated wallets if central wallet has >= $2.
 
         Notes:
@@ -1447,16 +1493,8 @@ class TokenTrendingBot:
                 except Exception:
                     return default
 
-            usd_per_wallet = _parse_float('FUND_USD_PER_WALLET', 1.0)
+            usd_per_wallet = _parse_float('FUND_USD_PER_WALLET', 3.0)
             gas_reserve_usd = _parse_float('GAS_RESERVE_USD', 1.0)
-
-            # Clamp out-of-range or unexpected values to exactly 1.0 (per requirement)
-            if usd_per_wallet != 1.0:
-                self.logger.warning(f"FUND_USD_PER_WALLET={usd_per_wallet} overridden to 1.0 per policy")
-                usd_per_wallet = 1.0
-            if gas_reserve_usd != 1.0:
-                self.logger.warning(f"GAS_RESERVE_USD={gas_reserve_usd} overridden to 1.0 per policy")
-                gas_reserve_usd = 1.0
 
             min_required_usd = gas_reserve_usd + usd_per_wallet
             if balance_usd < min_required_usd:
@@ -1501,6 +1539,14 @@ class TokenTrendingBot:
             await self.safe_reply_text(update, "❌ Failed to start funding. Please check logs and try again.")
 
     async def check_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # Enforce /connect in current session
+        if not context.user_data.get('token_connected', False):
+            await self.safe_reply_text(update, "❌ Please use /connect to set token details before using this command (required each session).")
+            return
+        # Enforce /connect in current session
+        if not context.user_data.get('token_connected', False):
+            await self.safe_reply_text(update, "❌ Please use /connect to set token details before using this command (required each session).")
+            return
         """Check the balance of the central wallet for the currently connected chain."""
         # Resolve chain from connection state
         chain = getattr(self, 'connected_chain', None) or (self.token_config.get('chain') if hasattr(self, 'token_config') else None)
@@ -1541,23 +1587,7 @@ class TokenTrendingBot:
                     f"<b>{chain} Central Wallet</b>\n"
                     f"• Address: <code>{addr_short}</code>\n"
                     f"• Balance: <code>{balance_native:.6f} {symbol}</code>\n"
-                    f"• USD: <code>${usd:.2f}</code>\n"
-                    f"• Explorer: {explorer}/address/{checksum}\n"
-                )
-                await self.safe_reply_text(update, response_text, parse_mode='HTML')
-                return
-            elif chain == 'SOL':
-                client = self.get_solana_client()
-                from solders.pubkey import Pubkey
-                lamports = client.get_balance(Pubkey.from_string(address)).value
-                balance_sol = lamports / 1_000_000_000
-                addr_short = f"{address[:6]}...{address[-4:]}"
-                response_text = (
-                    "💰 <b>Wallet Balance</b>\n\n"
-                    f"<b>SOL Central Wallet</b>\n"
-                    f"• Address: <code>{addr_short}</code>\n"
-                    f"• Balance: <code>{balance_sol:.6f} SOL</code>\n"
-                    f"• Explorer: https://solscan.io/address/{address}\n"
+                   
                 )
                 await self.safe_reply_text(update, response_text, parse_mode='HTML')
                 return
@@ -1569,6 +1599,10 @@ class TokenTrendingBot:
             await self.safe_reply_text(update, "❌ An error occurred while checking balances. Please try again later.")
 
     async def wallet_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # Enforce /connect in current session
+        if not context.user_data.get('token_connected', False):
+            await self.safe_reply_text(update, "❌ Please use /connect to set token details before using this command (required each session).")
+            return
         """Show number of generated wallets, count funded, and total distributed."""
         try:
             generated = len(self.wallets) if isinstance(self.wallets, list) else 0
@@ -1585,7 +1619,7 @@ class TokenTrendingBot:
                 try:
                     chain = (self.connected_chain or 'BNB').upper()
                     w3 = self.get_web3_for_chain(chain)
-                    min_balance = 0.00085
+                    min_balance, thresh_text = await self._compute_min_required_native(chain)
                     funded_detected = []
                     total_detected_balance = 0.0
 
@@ -1596,7 +1630,7 @@ class TokenTrendingBot:
                         try:
                             wei = await self._get_balance_with_retry(w3, addr)
                             bal = float(w3.from_wei(wei, 'ether'))
-                            if bal >= min_balance:
+                            if bal >= float(min_balance):
                                 funded_detected.append({'address': addr, 'balance': bal})
                                 total_detected_balance += bal
                         except Exception as e:
@@ -1634,7 +1668,7 @@ class TokenTrendingBot:
             status_text = (
                 "📊 <b>Wallet Status</b>\n\n"
                 f"• Generated Wallets: <b>{generated}</b>\n"
-                f"• Funded Wallets (>= 0.00085 BNB): <b>{funded_count}</b>\n"
+                f"• Funded Wallets (≥ {thresh_text if 'thresh_text' in locals() else '0.00085 BNB'}): <b>{funded_count}</b>\n"
                 f"• Total BNB Distributed (funding): <b>{total_bnb_distributed:.6f}</b>"
                 f"{preview}"
             )
@@ -1646,6 +1680,14 @@ class TokenTrendingBot:
             await self.safe_reply_text(update, "❌ An error occurred while fetching wallet status. Check logs for details.") 
 
     async def refresh_funded(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # Enforce /connect in current session
+        if not context.user_data.get('token_connected', False):
+            await self.safe_reply_text(update, "❌ Please use /connect to set token details before using this command (required each session).")
+            return
+        # Enforce /connect in current session
+        if not context.user_data.get('token_connected', False):
+            await self.safe_reply_text(update, "❌ Please use /connect to set token details before using this command (required each session).")
+            return
         """Rescan all loaded wallets on-chain and refresh funded cache."""
         try:
             if not self.wallets:
@@ -1653,10 +1695,12 @@ class TokenTrendingBot:
                 return
             chain = (self.connected_chain or 'BNB').upper()
             msg = await self.safe_reply_text(update, "🔄 Scanning wallets on-chain for funded balances...")
-            detected = await self._refresh_funded_from_chain(chain, min_balance=0.00085, force=True)
+            # Use USD-based min if configured
+            detected = await self._refresh_funded_from_chain(chain, min_balance=None, force=True)
+            _, thresh_text = await self._compute_min_required_native(chain)
             count = len(detected)
             if count == 0:
-                await self.safe_edit_text(msg, "❌ No funded wallets detected (>= 0.00085).")
+                await self.safe_edit_text(msg, f"❌ No funded wallets detected (≥ {thresh_text}).")
                 return
             total = sum(w.get('balance', 0.0) for w in detected)
             lines = []
@@ -1666,7 +1710,7 @@ class TokenTrendingBot:
                 lines.append(f"• <code>{addr[:6]}...{addr[-4:]}</code> — {bal:.4f} {chain}")
             more = f"\n• ...and {count-5} more" if count > 5 else ''
             text = (
-                f"✅ <b>Detected {count} funded wallets</b> (≥ 0.00085 {chain})\n"
+                f"✅ <b>Detected {count} funded wallets</b> (≥ {thresh_text})\n"
                 f"💼 <b>Total balance:</b> {total:.4f} {chain}\n\n"
                 + "\n".join(lines)
                 + more
@@ -1697,6 +1741,11 @@ class TokenTrendingBot:
             await self.safe_reply_text(update, "ℹ️ No operation to cancel.")
 
     async def start_trend(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # Enforce /connect in current session
+        if not context.user_data.get('token_connected', False):
+            await self.safe_reply_text(update, "❌ Please use /connect to set token details before starting a trend (required each session).")
+            return
+
         """Start trading/trending after comprehensive pre-flight checks."""
         try:
             # Initialize payment tracking if not exists
@@ -1761,7 +1810,7 @@ class TokenTrendingBot:
 
             # 3. Wallet balance verification with detailed feedback
             w3 = self.get_web3_for_chain(chain)
-            min_balance = 0.00085  # Minimum native token required per wallet (aligned with TradingCycle)
+            min_balance, thresh_text = await self._compute_min_required_native(chain)
             # If we're scanning all wallets (no cached funded list), expand the limit to include all
             max_wallets_to_check = len(funded) if scanning_all else 20
             
@@ -1796,7 +1845,7 @@ class TokenTrendingBot:
                     balance_wei = await self._get_balance_with_retry(w3, wallet_addr)
                     balance = float(w3.from_wei(balance_wei, 'ether'))
                     
-                    if balance >= min_balance:
+                    if balance >= float(min_balance):
                         working_wallets.append({
                             'address': wallet_addr,
                             'balance': balance,
@@ -1805,14 +1854,11 @@ class TokenTrendingBot:
                         total_balance += balance
                         
                         self.logger.info(
-                            f"✅ Wallet {wallet_addr[:8]}...{wallet_addr[-6:]} "
-                            f"has {balance:.6f} {chain} (≥ {min_balance} required)"
+                            f"✅ Wallet {wallet_addr[:8]}...{wallet_addr[-6:]} has {balance:.6f} {chain} (≥ {thresh_text} required)"
                         )
                     else:
                         self.logger.warning(
-                            f"⚠️  Wallet {wallet_addr[:8]}...{wallet_addr[-6:]} "
-                            f"has insufficient balance: {balance:.6f} {chain} "
-                            f"(needs {min_balance} {chain})"
+                            f"⚠️  Wallet {wallet_addr[:8]}...{wallet_addr[-6:]} has insufficient balance: {balance:.6f} {chain} (needs {thresh_text})"
                         )
                         
                 except Exception as e:
@@ -1824,7 +1870,7 @@ class TokenTrendingBot:
                 await self.safe_edit_text(
                     status_msg,
                     "❌ No wallets with sufficient balance found.\n\n"
-                    f"• Minimum required: {min_balance} {chain} per wallet\n"
+                    f"• Minimum required: {thresh_text} per wallet\n"
                     f"• Wallets checked: {total_wallets}\n\n"
                     "Please fund your wallets using /start_funding and try again."
                 )
@@ -1848,7 +1894,7 @@ class TokenTrendingBot:
                 bullet_lines.append(f"• <code>{addr[:6]}...{addr[-4:]}</code> — {w['balance']:.4f} {chain}")
             more = f"\n• ...and {len(working_wallets) - 5} more wallets" if len(working_wallets) > 5 else ''
             preflight_text = (
-                f"✅ <b>Found {len(working_wallets)} funded wallets</b> (≥ 0.00085 {chain})\n"
+                f"✅ <b>Found {len(working_wallets)} funded wallets</b> (≥ {thresh_text})\n"
                 f"💼 <b>Total balance:</b> {total_balance:.4f} {chain}\n\n"
                 f"📋 <b>Wallet summary</b>:\n" + "\n".join(bullet_lines) + more + "\n\n"
                 "🔄 Initializing trading cycle..."
@@ -1946,6 +1992,10 @@ class TokenTrendingBot:
                 )
 
     async def stop_trend(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # Enforce /connect in current session
+        if not context.user_data.get('token_connected', False):
+            await self.safe_reply_text(update, "❌ Please use /connect to set token details before using this command (required each session).")
+            return
         """Stop trading/trending. Placeholder implementation to satisfy handler."""
         try:
             # If a future trading loop uses a flag/task, we would cancel it here.

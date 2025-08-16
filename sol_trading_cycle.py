@@ -43,6 +43,12 @@ class SolanaTradingCycle:
         self.max_trades_per_wallet = 15
         self.trade_counts_today: Dict[str, int] = {}
         self.last_reset_date: Optional[str] = None
+        # Slippage (decimal, e.g., 0.01 for 1%)
+        import os
+        try:
+            self.slippage = float(os.getenv('SLIPPAGE', '0.01'))
+        except Exception:
+            self.slippage = 0.01
 
     async def start(self) -> str:
         if self.is_running:
@@ -110,19 +116,32 @@ class SolanaTradingCycle:
             if not self._has_min_balance(wallet['address'], amount_lamports + 200_000):
                 logging.warning(f"[SOL] Insufficient SOL for buy in {wallet['address']}")
                 return False
-            quote = self._jup_quote(
-                input_mint="So11111111111111111111111111111111111111112",
-                output_mint=self.token_address,
-                amount=amount_lamports,
-                slippage_bps=100,
-            )
-            if not quote:
-                logging.warning("[SOL] No quote from Jupiter")
-                return False
-            swap_tx_b64 = self._jup_swap_tx(quote, user_pubkey)
-            if not swap_tx_b64:
-                return False
-            return self._sign_and_send_b64_tx(swap_tx_b64, kp)
+            base_slippage = self.slippage
+            max_retries = 3
+            for attempt in range(max_retries + 1):
+                slippage_adj = min(base_slippage * (1 + 0.5 * attempt), 0.20)
+                slippage_bps = int(slippage_adj * 10000)
+                quote = self._jup_quote(
+                    input_mint="So11111111111111111111111111111111111111112",
+                    output_mint=self.token_address,
+                    amount=amount_lamports,
+                    slippage_bps=slippage_bps,
+                )
+                logging.info(f"[SOL] Buy attempt {attempt}: slippage={slippage_adj} (bps={slippage_bps}), quote={quote}")
+                if not quote:
+                    logging.warning("[SOL] No quote from Jupiter")
+                    if attempt == max_retries:
+                        return False
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                swap_tx_b64 = self._jup_swap_tx(quote, user_pubkey)
+                if not swap_tx_b64:
+                    if attempt == max_retries:
+                        return False
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                return self._sign_and_send_b64_tx(swap_tx_b64, kp)
+            return False
         except Exception as e:
             logging.error(f"[SOL] buy failed: {e}")
             return False
@@ -143,19 +162,32 @@ class SolanaTradingCycle:
             if amount_units < 10 ** max(decimals - 2, 0):
                 logging.info(f"[SOL] Balance too small to sell for {wallet['address']}")
                 return False
-            quote = self._jup_quote(
-                input_mint=self.token_address,
-                output_mint="So11111111111111111111111111111111111111112",
-                amount=amount_units,
-                slippage_bps=100,
-            )
-            if not quote:
-                logging.warning("[SOL] No sell quote from Jupiter")
-                return False
-            swap_tx_b64 = self._jup_swap_tx(quote, user_pubkey)
-            if not swap_tx_b64:
-                return False
-            return self._sign_and_send_b64_tx(swap_tx_b64, kp)
+            base_slippage = self.slippage
+            max_retries = 3
+            for attempt in range(max_retries + 1):
+                slippage_adj = min(base_slippage * (1 + 0.5 * attempt), 0.20)
+                slippage_bps = int(slippage_adj * 10000)
+                quote = self._jup_quote(
+                    input_mint=self.token_address,
+                    output_mint="So11111111111111111111111111111111111111112",
+                    amount=amount_units,
+                    slippage_bps=slippage_bps,
+                )
+                logging.info(f"[SOL] Sell attempt {attempt}: slippage={slippage_adj} (bps={slippage_bps}), quote={quote}")
+                if not quote:
+                    logging.warning("[SOL] No sell quote from Jupiter")
+                    if attempt == max_retries:
+                        return False
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                swap_tx_b64 = self._jup_swap_tx(quote, user_pubkey)
+                if not swap_tx_b64:
+                    if attempt == max_retries:
+                        return False
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                return self._sign_and_send_b64_tx(swap_tx_b64, kp)
+            return False
         except Exception as e:
             logging.error(f"[SOL] sell failed: {e}")
             return False

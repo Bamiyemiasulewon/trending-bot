@@ -26,7 +26,7 @@ from trading_config import (
     PANCAKE_ROUTER,
     TOKEN_PAIRS,
     GAS_PRICE,
-    SLIPPAGE,
+    SLIPPAGE,  # decimal, e.g., 0.01 for 1%
     TRADE_AMOUNT,
     TRADING_MODES
 )
@@ -172,7 +172,7 @@ class WalletManager:
         return len(self.wallets[chain])
         
     async def check_wallet_balances(self, chain: str, provider_url: str = None, min_balance: float = 0.00085) -> dict:
-        """Check and update balances for all wallets on a chain with improved error handling and retries.
+        """Check and update balances for all wallets with detailed reporting.
         
         Args:
             chain: The blockchain network (ETH, BNB, SOL)
@@ -180,21 +180,21 @@ class WalletManager:
             min_balance: Minimum balance threshold to consider a wallet as 'funded'
             
         Returns:
-            dict: {
-                'total_wallets': int,
-                'funded_wallets': int,
-                'total_balance': float,
-                'wallets': List[dict]  # List of wallet details with balances
-            }
+            dict: Detailed wallet information and balances
         """
         chain = chain.upper()
         if chain not in self.wallets:
             raise ValueError(f"Unsupported chain: {chain}")
-            
+        
+        w3 = Web3(HTTPProvider(provider_url)) if provider_url else self.w3
+        
         result = {
             'total_wallets': len(self.wallets[chain]),
             'funded_wallets': 0,
             'total_balance': 0.0,
+            'low_balance_wallets': [],
+            'error_wallets': [],
+            'active_wallets': [],
             'wallets': []
         }
         

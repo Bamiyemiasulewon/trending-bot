@@ -1,5 +1,6 @@
 # Environment variables and sensitive data
 .env
+# .env
 .env.*
 !.env.example
 config.env

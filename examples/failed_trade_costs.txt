@@ -1,0 +1,30 @@
+Example Cost Analysis:
+
+1. Failed Transaction (Without Checks):
+   - Gas used: 241,185 (from your screenshot)
+   - Gas cost: 0.000241185 BNB ($0.02)
+   - If 5 trades fail: ~$0.10 wasted
+   - From $1 wallet: 10% of funds lost to failed trades
+
+2. With Safety Checks:
+   - Checks run before trading: No gas cost
+   - Failed checks: No gas wasted
+   - Only attempts trades likely to succeed
+   - Preserves wallet balance for successful trades
+
+Safety Checks Prevent:
+✓ Trading tokens with no liquidity
+✓ Trading when gas prices are too high
+✓ Attempting trades with insufficient balance
+✓ Getting stuck with unsellable tokens
+✓ Network-related transaction failures
+
+Cost Comparison (Example with $1 BNB wallet):
+Without Checks:
+- 5 failed trades = $0.10 lost
+- Successful trade might be impossible after losses
+
+With Checks:
+- No gas wasted on failed trades
+- Full balance available for successful trades
+- Higher success rate on attempted trades

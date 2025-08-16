@@ -1,7 +1,14 @@
 """
 Trading Bot Configuration
 
-This module contains all configuration parameters for the trading bot,
+This mo# ===== TRADING PARAMETERS =====
+# Percentage-based trading configuration
+TRADE_PERCENTAGE = {
+    'max': Decimal(os.getenv('MAX_TRADE_PERCENTAGE', '0.50')),  # 50% of available balance
+    'min': Decimal(os.getenv('MIN_TRADE_PERCENTAGE', '0.35')),  # 35% of available balance
+}
+
+# Slippage tolerance (0.01 = 1%)tains all configuration parameters for the trading bot,
 including wallet settings, trading parameters, and DEX configurations.
 """
 import os
@@ -16,11 +23,14 @@ load_dotenv()
 # Number of wallets to use for trading
 WALLET_COUNT = int(os.getenv('WALLET_COUNT', '5'))
 
-# Minimum BNB balance required in each wallet (in BNB)
-MIN_WALLET_BALANCE = Decimal(os.getenv('MIN_WALLET_BALANCE', '0.01'))
+# Minimum BNB balance required in each wallet (in BNB) - around $0.20 worth
+MIN_WALLET_BALANCE = Decimal(os.getenv('MIN_WALLET_BALANCE', '0.0007'))
 
-# Amount of BNB to top up when balance is low (in BNB)
-TOP_UP_AMOUNT = Decimal(os.getenv('TOP_UP_AMOUNT', '0.05'))
+# Amount of BNB to top up when balance is low (in BNB) - $1 worth
+TOP_UP_AMOUNT = Decimal(os.getenv('TOP_UP_AMOUNT', '0.003'))
+
+# Reserve for gas fees (in BNB) - around $0.15 worth
+GAS_RESERVE = Decimal(os.getenv('GAS_RESERVE', '0.0005'))
 
 # ===== TRADING CONFIGURATION =====
 # Default token to trade (BNB token address)
@@ -34,17 +44,23 @@ TOKEN_PAIRS = {
 }
 
 # ===== TRADING PARAMETERS =====
-# Buy/Sell amount in BNB
+# Buy/Sell amount in BNB (adjusted for $0.77 total balance)
 TRADE_AMOUNT = {
-    'min': Decimal(os.getenv('MIN_TRADE_AMOUNT', '0.001')),  # Minimum trade amount in BNB
-    'max': Decimal(os.getenv('MAX_TRADE_AMOUNT', '0.01')),   # Maximum trade amount in BNB
+    'min': Decimal(os.getenv('MIN_TRADE_AMOUNT', '0.0008')),     # About $0.25 worth
+    'max': Decimal(os.getenv('MAX_TRADE_AMOUNT', '0.0012')),    # About $0.35 worth
 }
 
 # Slippage tolerance (0.01 = 1%)
-SLIPPAGE = Decimal(os.getenv('SLIPPAGE', '0.05'))
+SLIPPAGE = Decimal(os.getenv('SLIPPAGE', '0.05'))  # 5% slippage
 
-# Gas price (in wei) - set to 0 for automatic
-GAS_PRICE = int(os.getenv('GAS_PRICE', '0'))
+# Gas price settings (in gwei)
+GAS_PRICE = int(os.getenv('GAS_PRICE', '0'))  # 0 for automatic
+MAX_GAS_PRICE = int(os.getenv('MAX_GAS_PRICE', '8'))  # Maximum acceptable gas price in gwei
+GAS_PRICE_CHECK_INTERVAL = int(os.getenv('GAS_PRICE_CHECK_INTERVAL', '60'))  # Seconds between gas checks
+
+# Gas price alerts (in gwei)
+GAS_PRICE_WARNING = int(os.getenv('GAS_PRICE_WARNING', '6'))  # Warning level
+GAS_PRICE_CRITICAL = int(os.getenv('GAS_PRICE_CRITICAL', '8'))  # Stop trading level
 
 # ===== TRADING MODES =====
 # Enable/disable trading modes
