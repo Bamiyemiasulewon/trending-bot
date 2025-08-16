@@ -29,7 +29,21 @@ except ImportError:
         SolanaTradingCycle = None
 from solana.rpc.api import Client as SolClient
 
- 
+# Trending platforms manager
+try:
+    from .trending_platforms import TrendingPlatformManager
+except Exception:
+    from trending_platforms import TrendingPlatformManager
+
+# Payment manager (optional, for paid/recorded campaigns)
+try:
+    from .payment_manager import PaymentManager
+except Exception:
+    try:
+        from payment_manager import PaymentManager
+    except Exception:
+        PaymentManager = None
+
 
 class TokenTrendingBot:
     def __init__(self):
@@ -58,6 +72,10 @@ class TokenTrendingBot:
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         )
         self.logger = logging.getLogger(__name__)
+        # Trending platforms manager
+        self.trending_mgr = TrendingPlatformManager(self.logger)
+        # Initialize payment manager if available
+        self.payment_mgr = PaymentManager() if 'PaymentManager' in globals() and PaymentManager else None
         
         # Initialize native price cache (BNB/ETH)
         self._price_cache = {
@@ -424,6 +442,21 @@ class TokenTrendingBot:
             self.connected_chain = chain
             # Mark token as connected for this session
             context.user_data['token_connected'] = True
+            
+            # Ensure a payment_id exists for later payment/campaign updates (non-blocking for organic trending)
+            try:
+                if self.payment_mgr is not None and not context.user_data.get('payment_id'):
+                    user_id = None
+                    try:
+                        user_id = update.effective_user.id if update and update.effective_user else None
+                    except Exception:
+                        user_id = None
+                    payment = self.payment_mgr.create_payment(user_id or 'unknown', chain, token_address)
+                    context.user_data['payment_id'] = payment.get('payment_id')
+                    self.logger.info(f"Created payment_id for user {user_id}: {context.user_data['payment_id']}")
+            except Exception as pe:
+                # Do not block the flow; just log
+                self.logger.warning(f"payment_id setup skipped due to error: {pe}")
             # Clear the state
             del context.user_data['awaiting_token_info']
             
@@ -1941,6 +1974,13 @@ class TokenTrendingBot:
                     # Start the trading cycle
                     start_msg = await self.trading_cycle.start()
                     
+                    # 6b. Activate external trending platforms (DexScreener/DEXTools)
+                    try:
+                        selected_platforms = self.trending_mgr.activate_platforms(chain, token_addr)
+                    except Exception as te:
+                        self.logger.warning(f"Trending platforms activation failed: {te}")
+                        selected_platforms = []
+
                     # Final success message
                     await self.safe_edit_text(
                         status_msg,
@@ -1948,15 +1988,18 @@ class TokenTrendingBot:
                         f"• Token: {token_addr}\n"
                         f"• Chain: {chain}\n"
                         f"• Wallets: {len(working_wallets)} ready\n"
-                        f"• Total balance: {total_balance:.4f} {chain}\n\n"
+                        f"• Total balance: {total_balance:.4f} {chain}\n"
+                        f"• Trending platforms: {', '.join(selected_platforms) if selected_platforms else 'none'}\n\n"
                         f"{start_msg}\n\n"
                         "Use /stop_trend to stop the trading cycle."
                     )
                     
                 except Exception as e:
+                    # Handle errors that occur during wallet prep/trading start/platform activation
                     self.logger.error(f"Error initializing trading cycle: {str(e)}", exc_info=True)
-                    raise Exception(f"Failed to initialize trading cycle: {str(e)}")
-                    
+                    # Re-raise to be caught by the outer try/except for unified user feedback
+                    raise
+
             except ImportError as ie:
                 await self.safe_edit_text(
                     status_msg,
