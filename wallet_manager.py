@@ -292,3 +292,211 @@ class WalletManager:
                 wallet['last_used'] = current_time
                 
         self.save_wallets()
+        
+    def get_total_balance(self, chain: str) -> dict:
+        """
+        Get total balance across all wallets for a specific chain
+        
+        Args:
+            chain: The blockchain network (ETH, BNB, SOL)
+            
+        Returns:
+            dict: {
+                'total_balance': float,  # Total balance in native token
+                'wallet_count': int,     # Number of wallets with balance
+                'wallets': List[Dict]    # List of wallets with balances
+            }
+        """
+        chain = chain.upper()
+        if chain not in self.wallets:
+            raise ValueError(f"Unsupported chain: {chain}")
+            
+        result = {
+            'total_balance': 0.0,
+            'wallet_count': 0,
+            'wallets': []
+        }
+        
+        for wallet in self.wallets[chain]:
+            if 'balance' in wallet and isinstance(wallet['balance'], (int, float)) and wallet['balance'] > 0:
+                result['total_balance'] += wallet['balance']
+                result['wallet_count'] += 1
+                result['wallets'].append({
+                    'address': wallet['address'],
+                    'balance': wallet['balance']
+                })
+                
+        return result
+        
+    async def consolidate_funds(self, chain: str, destination_address: str, gas_price_gwei: float = None, 
+                              max_gas_fee: float = 0.001) -> dict:
+        """
+        Transfer funds from all wallets to a destination address, leaving enough for gas fees.
+        
+        Args:
+            chain: The blockchain network (ETH, BNB, SOL)
+            destination_address: The address to send funds to
+            gas_price_gwei: Gas price in Gwei (if None, uses current network gas price)
+            max_gas_fee: Maximum gas fee to leave in each wallet (in native token)
+            
+        Returns:
+            dict: {
+                'success': bool,
+                'total_sent': float,
+                'tx_hashes': List[str],
+                'errors': List[Dict]
+            }
+        """
+        chain = chain.upper()
+        if chain not in ['ETH', 'BNB']:
+            raise ValueError("Only ETH and BNB chains are currently supported for consolidation")
+            
+        if not self.w3.is_address(destination_address):
+            raise ValueError("Invalid destination address")
+            
+        destination_address = self.w3.to_checksum_address(destination_address)
+        result = {
+            'success': False,
+            'total_sent': 0.0,
+            'tx_hashes': [],
+            'errors': []
+        }
+        
+        # Get current gas price if not provided
+        if gas_price_gwei is None:
+            gas_price_wei = self.w3.eth.gas_price
+        else:
+            gas_price_wei = self.w3.to_wei(gas_price_gwei, 'gwei')
+            
+        # Estimate gas cost for a standard transfer (21,000 gas for ETH/BNB transfer)
+        gas_limit = 21000
+        gas_cost_wei = gas_price_wei * gas_limit
+        gas_cost_eth = self.w3.from_wei(gas_cost_wei, 'ether')
+        
+        # Process each wallet
+        for wallet in self.wallets[chain]:
+            try:
+                if 'private_key' not in wallet or not wallet.get('is_active', True):
+                    continue
+                    
+                wallet_address = self.w3.to_checksum_address(wallet['address'])
+                balance_wei = await self._get_balance_with_retry(self.w3, wallet_address)
+                
+                if balance_wei <= 0:
+                    continue
+                    
+                balance_eth = self.w3.from_wei(balance_wei, 'ether')
+                
+                # Calculate amount to send (leave enough for gas)
+                if balance_eth <= gas_cost_eth + max_gas_fee:
+                    continue  # Skip if not enough to cover gas + max_gas_fee
+                    
+                amount_to_send_wei = balance_wei - (gas_cost_wei + self.w3.to_wei(max_gas_fee, 'ether'))
+                
+                # Build and send transaction
+                nonce = self.w3.eth.get_transaction_count(wallet_address)
+                tx = {
+                    'nonce': nonce,
+                    'to': destination_address,
+                    'value': amount_to_send_wei,
+                    'gas': gas_limit,
+                    'gasPrice': gas_price_wei,
+                    'chainId': 56 if chain == 'BNB' else 1  # BSC or ETH mainnet
+                }
+                
+                # Sign and send transaction
+                signed_tx = self.w3.eth.account.sign_transaction(tx, wallet['private_key'])
+                tx_hash = self.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+                
+                # Wait for transaction receipt
+                receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
+                
+                if receipt.status == 1:  # Success
+                    result['tx_hashes'].append(tx_hash.hex())
+                    result['total_sent'] += float(self.w3.from_wei(amount_to_send_wei, 'ether'))
+                    
+                    # Update wallet balance
+                    wallet['balance'] = float(self.w3.from_wei(
+                        self.w3.eth.get_balance(wallet_address), 'ether'
+                    ))
+                else:
+                    result['errors'].append({
+                        'wallet': wallet_address,
+                        'error': 'Transaction failed',
+                        'tx_hash': tx_hash.hex()
+                    })
+                    
+            except Exception as e:
+                self.logger.error(f"Error consolidating from {wallet.get('address')}: {str(e)}")
+                result['errors'].append({
+                    'wallet': wallet.get('address', 'unknown'),
+                    'error': str(e)
+                })
+                continue
+                
+        result['success'] = len(result['errors']) == 0 or len(result['tx_hashes']) > 0
+        self.save_wallets()
+        return result
+        
+    def validate_wallet_address(self, address: str, chain: str) -> tuple[bool, str]:
+        """
+        Validate a wallet address for the specified chain
+        
+        Args:
+            address: The wallet address to validate
+            chain: The blockchain network (ETH, BNB, SOL)
+            
+        Returns:
+            tuple: (is_valid: bool, error_message: str)
+        """
+        if not address or not isinstance(address, str):
+            return False, "Address cannot be empty"
+            
+        address = address.strip()
+        chain = chain.upper()
+        
+        if chain in ['ETH', 'BNB']:
+            # Remove common prefixes if present
+            if address.startswith('0x'):
+                address = address[2:]
+                
+            # Validate length (40 hex chars without 0x)
+            if len(address) != 40:
+                return False, f"Invalid {chain} address length. Expected 40 hex characters (excluding 0x)."
+                
+            # Validate hex characters
+            try:
+                int(address, 16)
+            except ValueError:
+                return False, f"Invalid {chain} address format. Must be a valid hexadecimal number."
+                
+            # Convert to checksum address and validate
+            try:
+                checksum_address = self.w3.to_checksum_address(f"0x{address}")
+                if checksum_address != f"0x{address}" and checksum_address.lower() != f"0x{address.lower()}":
+                    return False, f"Invalid {chain} address checksum. Did you mean {checksum_address}?"
+                return True, ""
+            except Exception as e:
+                return False, f"Invalid {chain} address: {str(e)}"
+                
+        elif chain == 'SOL':
+            import base58
+            # Remove URI scheme if present
+            if ':' in address:
+                address = address.split(':')[-1]
+                
+            # Validate length (32-44 chars)
+            if len(address) < 32 or len(address) > 44:
+                return False, "Invalid Solana address length. Expected 32-44 base58 characters."
+                
+            # Validate base58 encoding
+            try:
+                decoded = base58.b58decode(address)
+                # Solana public keys are 32 bytes when decoded
+                if len(decoded) != 32:
+                    return False, "Invalid Solana address format. Decoded address must be 32 bytes."
+                return True, ""
+            except Exception as e:
+                return False, f"Invalid Solana address: {str(e)}"
+                
+        return False, f"Unsupported blockchain: {chain}"

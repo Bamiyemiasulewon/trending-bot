@@ -6,9 +6,9 @@ import asyncio
 import time
 import uuid
 import requests
-from telegram import Update
-from telegram.constants import ChatAction
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
+from telegram.constants import ChatAction, ParseMode
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 from telegram.request import HTTPXRequest
 from dotenv import load_dotenv
 from web3 import Web3, HTTPProvider
@@ -733,6 +733,32 @@ class TokenTrendingBot:
         self.app.add_handler(CommandHandler("cancel", self.cancel))
         self.app.add_handler(CommandHandler("start_trend", self.start_trend))
         self.app.add_handler(CommandHandler("stop_trend", self.stop_trend))
+        
+        # Set up conversation handler for withdrawals
+        withdrawal_conv_handler = ConversationHandler(
+            entry_points=[CommandHandler("withdraw_funds", self.withdraw_funds)],
+            states={
+                'AWAITING_WALLET_ADDRESS': [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        self.handle_withdraw_address
+                    )
+                ],
+                'CONFIRM_WITHDRAWAL': [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND,
+                        self.confirm_withdrawal
+                    )
+                ],
+            },
+            fallbacks=[
+                CommandHandler("cancel", self.cancel),
+                MessageHandler(filters.COMMAND, self.cancel)
+            ],
+        )
+        
+        self.app.add_handler(withdrawal_conv_handler)
+        
         # Global error handler
         self.app.add_error_handler(self.on_error)
         
@@ -1717,61 +1743,44 @@ class TokenTrendingBot:
         if not context.user_data.get('token_connected', False):
             await self.safe_reply_text(update, "❌ Please use /connect to set token details before using this command (required each session).")
             return
-        # Enforce /connect in current session
-        if not context.user_data.get('token_connected', False):
-            await self.safe_reply_text(update, "❌ Please use /connect to set token details before using this command (required each session).")
-            return
-        """Rescan all loaded wallets on-chain and refresh funded cache."""
+            
         try:
             if not self.wallets:
                 await self.safe_reply_text(update, "❌ No wallets loaded. Use /create_wallet first.")
                 return
+                
             chain = (self.connected_chain or 'BNB').upper()
             msg = await self.safe_reply_text(update, "🔄 Scanning wallets on-chain for funded balances...")
+            
             # Use USD-based min if configured
             detected = await self._refresh_funded_from_chain(chain, min_balance=None, force=True)
             _, thresh_text = await self._compute_min_required_native(chain)
             count = len(detected)
+            
             if count == 0:
                 await self.safe_edit_text(msg, f"❌ No funded wallets detected (≥ {thresh_text}).")
                 return
+                
             total = sum(w.get('balance', 0.0) for w in detected)
             lines = []
             for w in detected[:5]:
                 addr = w['address']
                 bal = float(w.get('balance', 0.0) or 0.0)
                 lines.append(f"• <code>{addr[:6]}...{addr[-4:]}</code> — {bal:.4f} {chain}")
+                
             more = f"\n• ...and {count-5} more" if count > 5 else ''
-            text = (
+            status_text = (
                 f"✅ <b>Detected {count} funded wallets</b> (≥ {thresh_text})\n"
                 f"💼 <b>Total balance:</b> {total:.4f} {chain}\n\n"
                 + "\n".join(lines)
                 + more
             )
-            await self.safe_edit_text(msg, text, parse_mode='HTML')
+            
+            await self.safe_edit_text(msg, status_text)
+            
         except Exception as e:
-            self.logger.error(f"Error in refresh_funded: {e}", exc_info=True)
-            await self.safe_reply_text(update, "❌ Failed to refresh funded wallets. Check logs.")
-
-    async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Cancel any ongoing interactive operation and clear related state."""
-        cancelled = False
-        # Cancel token info flow
-        if context.user_data.get('awaiting_token_info'):
-            for key in ['awaiting_token_info', 'token_address', 'chain']:
-                context.user_data.pop(key, None)
-            await self.safe_reply_text(update, "❌ Token connection cancelled. Use /connect to start over.")
-            cancelled = True
-
-        # Cancel funding confirmation flow
-        if context.user_data.get('awaiting_funding_confirmation'):
-            for key in ['awaiting_funding_confirmation', 'funding_details', 'funding_amount', 'funding_gas_price']:
-                context.user_data.pop(key, None)
-            await self.safe_reply_text(update, "❌ Wallet funding cancelled. Use /fund_wallet to start over.")
-            cancelled = True
-
-        if not cancelled:
-            await self.safe_reply_text(update, "ℹ️ No operation to cancel.")
+            self.logger.error(f"Error in refresh_funded: {str(e)}")
+            await self.safe_reply_text(update, f"❌ Error scanning wallets: {str(e)}")
 
     async def start_trend(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Enforce /connect in current session
@@ -2046,6 +2055,257 @@ class TokenTrendingBot:
         except Exception as e:
             self.logger.error(f"Error in stop_trend: {str(e)}", exc_info=True)
             await self.safe_reply_text(update, "❌ Failed to stop trend. Please try again later.")
+            
+    async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Cancels and ends the conversation."""
+        # Clear any withdrawal-related user data
+        if 'withdraw_chain' in context.user_data:
+            del context.user_data['withdraw_chain']
+        if 'withdraw_address' in context.user_data:
+            del context.user_data['withdraw_address']
+            
+        await update.message.reply_text(
+            '❌ Operation cancelled.',
+            reply_markup=ReplyKeyboardRemove(),
+            parse_mode='Markdown'
+        )
+        return ConversationHandler.END
+
+    async def withdraw_funds(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Start the withdrawal process"""
+        user_id = update.effective_user.id
+        if not self._is_authorized(user_id):
+            await update.message.reply_text("❌ You are not authorized to use this command.")
+            return ConversationHandler.END
+            
+        # Check if we have a connected chain
+        if not self.connected_chain:
+            await update.message.reply_text(
+                "❌ No blockchain connected. Please connect a blockchain first using /connect."
+            )
+            return ConversationHandler.END
+            
+        # Initialize WalletManager if not already done
+        if not hasattr(self, 'wallet_manager'):
+            self.wallet_manager = WalletManager()
+            
+        # Check total available balance
+        balance_info = self.wallet_manager.get_total_balance(self.connected_chain)
+        
+        if balance_info['total_balance'] <= 0:
+            await update.message.reply_text(
+                "❌ No funds available for withdrawal."
+            )
+            return ConversationHandler.END
+            
+        # Store chain in context for the next step
+        context.user_data['withdraw_chain'] = self.connected_chain
+        
+        # Prompt for wallet address
+        await update.message.reply_text(
+            f"💼 *Withdrawal Request*\n\n"
+            f"Total available: *{balance_info['total_balance']:.6f} {self.connected_chain}*\n"
+            f"Number of wallets with balance: *{balance_info['wallet_count']}*\n\n"
+            f"Please enter the destination wallet address:",
+            parse_mode='Markdown'
+        )
+        
+        return 'AWAITING_WALLET_ADDRESS'
+        
+    async def handle_withdraw_address(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Handle the wallet address input for withdrawal"""
+        user_id = update.effective_user.id
+        if not self._is_authorized(user_id):
+            await update.message.reply_text("❌ You are not authorized to perform this action.")
+            return ConversationHandler.END
+            
+        wallet_address = update.message.text.strip()
+        chain = context.user_data.get('withdraw_chain')
+        
+        if not chain:
+            await update.message.reply_text("❌ Error: No chain specified. Please start over with /withdraw_funds.")
+            return ConversationHandler.END
+            
+        # Initialize WalletManager if not already done
+        if not hasattr(self, 'wallet_manager'):
+            self.wallet_manager = WalletManager()
+            
+        # Validate wallet address with enhanced validation
+        is_valid, error_msg = self.wallet_manager.validate_wallet_address(wallet_address, chain)
+        if not is_valid:
+            # Provide specific error message from validation
+            error_text = f"❌ {error_msg or f'Invalid {chain} address'}"
+            
+            # Add helpful hints based on chain
+            if chain in ['ETH', 'BNB']:
+                error_text += "\n\nFor EVM addresses, ensure:\n"
+                error_text += "• It starts with '0x'\n"
+                error_text += "• It's exactly 42 characters long\n"
+                error_text += "• It contains only hexadecimal characters (0-9, a-f, A-F)"
+            elif chain == 'SOL':
+                error_text += "\n\nFor Solana addresses, ensure:\n"
+                error_text += "• It's between 32-44 characters long\n"
+                error_text += "• It contains only base58 characters\n"
+                error_text += "• No special characters except alphanumeric"
+                
+            await update.message.reply_text(
+                error_text,
+                parse_mode='Markdown'
+            )
+            return 'AWAITING_WALLET_ADDRESS'
+            
+        # Store the validated address
+        context.user_data['withdraw_address'] = wallet_address
+        
+        # Show confirmation
+        await update.message.reply_text(
+            f"📝 *Withdrawal Confirmation*\n\n"
+            f"• Destination: `{wallet_address}`\n"
+            f"• Network: {chain}\n\n"
+            f"Please confirm the withdrawal by typing `CONFIRM` or cancel with /cancel.",
+            parse_mode='Markdown',
+            reply_markup=ReplyKeyboardMarkup(
+                [[KeyboardButton('CONFIRM')], [KeyboardButton('Cancel')]],
+                one_time_keyboard=True,
+                resize_keyboard=True
+            )
+        )
+        
+        return 'CONFIRM_WITHDRAWAL'
+        
+    async def confirm_withdrawal(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Handle withdrawal confirmation"""
+        user_id = update.effective_user.id
+        if not self._is_authorized(user_id):
+            await update.message.reply_text("❌ You are not authorized to perform this action.")
+            return ConversationHandler.END
+            
+        if update.message.text.upper() != 'CONFIRM':
+            await update.message.reply_text("❌ Withdrawal cancelled.")
+            return ConversationHandler.END
+            
+        chain = context.user_data.get('withdraw_chain')
+        wallet_address = context.user_data.get('withdraw_address')
+        
+        if not chain or not wallet_address:
+            await update.message.reply_text("❌ Error: Missing withdrawal details. Please start over.")
+            return ConversationHandler.END
+            
+        # Start withdrawal process
+        processing_msg = await update.message.reply_text("⏳ Processing withdrawal, please wait...")
+        
+        try:
+            # Initialize WalletManager if not already done
+            if not hasattr(self, 'wallet_manager'):
+                self.wallet_manager = WalletManager()
+                
+            # Consolidate funds
+            result = await self.wallet_manager.consolidate_funds(
+                chain=chain,
+                destination_address=wallet_address,
+                gas_price_gwei=None,  # Use current network gas price
+                max_gas_fee=0.001  # Leave 0.001 native token for gas in each wallet
+            )
+            
+            if result['success'] and result['total_sent'] > 0:
+                # Format the explorer link based on chain
+                explorer_name = {
+                    'BNB': 'BscScan',
+                    'ETH': 'Etherscan',
+                    'SOL': 'Solana Explorer'
+                }.get(chain, 'Block Explorer')
+                
+                # Format wallet address for display (first 6 and last 4 characters)
+                display_address = (
+                    f"{wallet_address[:6]}...{wallet_address[-4:]}"
+                    if len(wallet_address) > 10
+                    else wallet_address
+                )
+                
+                # Success message with transaction details and explorer link
+                message = (
+                    "<b>✅ Withdrawal Successful!</b>\n\n"
+                    f"<b>Amount Sent:</b> <code>{result['total_sent']:.6f} {chain}</code>\n"
+                    f"<b>Destination:</b> <code>{display_address}</code>\n"
+                    f"<b>Transaction Count:</b> {len(result['tx_hashes'])}\n\n"
+                    "<i>Funds have been transferred to your wallet.</i>"
+                )
+                
+                # Add explorer link to wallet
+                if chain in ['BNB', 'ETH']:
+                    explorer_base = {
+                        'BNB': 'https://bscscan.com/address/',
+                        'ETH': 'https://etherscan.io/address/'
+                    }[chain]
+                    message += f"\n\n🔍 <a href=\"{explorer_base}{wallet_address}\">View on {explorer_name}</a>"
+                
+                # Add transaction hashes if available
+                if result['tx_hashes']:
+                    message += "\n\n<b>Transactions:</b>"
+                    for i, tx_hash in enumerate(result['tx_hashes'], 1):
+                        tx_url = self._get_explorer_url(chain, tx_hash)
+                        message += f"\n{i}. <a href=\"{tx_url}\">{tx_hash[:8]}...{tx_hash[-4:]}</a>"
+                
+                await processing_msg.edit_text(
+                    message,
+                    parse_mode='HTML',
+                    reply_markup=ReplyKeyboardRemove(),
+                    disable_web_page_preview=True
+                )
+            else:
+                error_msg = "❌ Withdrawal failed. No funds were transferred."
+                if result['errors']:
+                    error_msg += "\n\n*Errors:*\n"
+                    error_msg += "\n".join([f"• {e.get('wallet')}: {e.get('error')}" for e in result['errors'][:3]])
+                    if len(result['errors']) > 3:
+                        error_msg += f"\n... and {len(result['errors']) - 3} more"
+                
+                await processing_msg.edit_text(
+                    error_msg,
+                    parse_mode='Markdown',
+                    reply_markup=ReplyKeyboardRemove()
+                )
+                
+        except Exception as e:
+            self.logger.error(f"Withdrawal error: {str(e)}", exc_info=True)
+            await processing_msg.edit_text(
+                f"❌ Error during withdrawal: {str(e)}",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            
+        # Clear user data
+        if 'withdraw_chain' in context.user_data:
+            del context.user_data['withdraw_chain']
+        if 'withdraw_address' in context.user_data:
+            del context.user_data['withdraw_address']
+            
+        return ConversationHandler.END
+        
+    def _is_authorized(self, user_id: int) -> bool:
+        """Check if a user is authorized to use admin commands.
+        
+        Args:
+            user_id: The Telegram user ID to check
+            
+        Returns:
+            bool: True if authorized, False otherwise
+        """
+        # Get list of authorized user IDs from environment variable
+        authorized_users = os.getenv('AUTHORIZED_USERS', '').split(',')
+        authorized_user_ids = [int(uid.strip()) for uid in authorized_users if uid.strip().isdigit()]
+        
+        # Allow if user ID is in the authorized list or if no authorized users are set (for development)
+        return not authorized_user_ids or user_id in authorized_user_ids
+
+    def _get_explorer_url(self, chain: str, tx_hash: str) -> str:
+        """Get blockchain explorer URL for a transaction"""
+        if chain == 'BNB':
+            return f"https://bscscan.com/tx/{tx_hash}"
+        elif chain == 'ETH':
+            return f"https://etherscan.io/tx/{tx_hash}"
+        elif chain == 'SOL':
+            return f"https://explorer.solana.com/tx/{tx_hash}"
+        return "#"
 
     def run(self):
         """Starts the bot."""
