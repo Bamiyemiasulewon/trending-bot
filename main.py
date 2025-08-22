@@ -1,11 +1,11 @@
 import os
 import json
 import logging
-import traceback
 import asyncio
 import time
 import uuid
 import requests
+from decimal import Decimal
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
@@ -152,6 +152,9 @@ class TokenTrendingBot:
             except Exception as e:
                 self.logger.error(f"Error validating central wallet: {str(e)}")
                 self.central_wallet_address = ''
+        # Initialize WalletManager
+        self.wallet_manager = WalletManager()
+
         # Load wallets if we have a connected chain
         if self.connected_chain:
             self.logger.info(f"Loading wallets for chain: {self.connected_chain}")
@@ -189,6 +192,9 @@ class TokenTrendingBot:
                         # Normalize list of dicts {address, private_key?}
                         self.wallets = data if isinstance(data, list) else []
                         self.logger.info(f"Loaded {len(self.wallets)} wallets")
+                        # Pass wallets to WalletManager
+                        if self.wallet_manager:
+                            self.wallet_manager.wallets[self.connected_chain] = self.wallets
             except Exception as e:
                 self.logger.error(f"Error loading wallets for chain {self.connected_chain}: {e}", exc_info=True)
 
@@ -716,7 +722,7 @@ class TokenTrendingBot:
         
         # Set up conversation handler for withdrawals
         withdrawal_conv_handler = ConversationHandler(
-            entry_points=[CommandHandler("withdraw", self.withdraw_funds)],
+            entry_points=[CommandHandler("withdraw_funds", self.withdraw_funds)],
             states={
                 'AWAITING_WALLET_ADDRESS': [MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_withdraw_address)],
                 'CONFIRM_WITHDRAWAL': [MessageHandler(filters.TEXT & ~filters.COMMAND, self.confirm_withdrawal)],
@@ -2027,17 +2033,18 @@ class TokenTrendingBot:
                 )
 
     async def stop_trend(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # Enforce /connect in current session
-        if not context.user_data.get('token_connected', False):
-            await self.safe_reply_text(update, "❌ Please use /connect to set token details before using this command (required each session).")
-            return
-        """Stop trading/trending. Placeholder implementation to satisfy handler."""
+        """Stops the current trading/trending cycle."""
         try:
-            # If a future trading loop uses a flag/task, we would cancel it here.
-            await self.safe_reply_text(update, "🛑 Trading stopped (no active trading loop running).")
+            if self.trading_cycle and self.trading_cycle.is_running:
+                stop_message = await self.trading_cycle.stop()
+                self.trading_cycle = None  # Clear the cycle
+                self.logger.info("Trading cycle stopped by user command.")
+                await self.safe_reply_text(update, f"✅ {stop_message}")
+            else:
+                await self.safe_reply_text(update, "ℹ️ No active trading cycle to stop.")
         except Exception as e:
             self.logger.error(f"Error in stop_trend: {str(e)}", exc_info=True)
-            await self.safe_reply_text(update, "❌ Failed to stop trend. Please try again later.")
+            await self.safe_reply_text(update, "❌ Failed to stop trend. Please check logs.")
             
     async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Cancels and ends the conversation."""
@@ -2067,10 +2074,6 @@ class TokenTrendingBot:
                 "❌ No blockchain connected. Please connect a blockchain first using /connect."
             )
             return ConversationHandler.END
-            
-        # Initialize WalletManager if not already done
-        if not hasattr(self, 'wallet_manager'):
-            self.wallet_manager = WalletManager()
             
         # Check total available balance
         balance_info = self.wallet_manager.get_total_balance(self.connected_chain)
@@ -2108,10 +2111,6 @@ class TokenTrendingBot:
         if not chain:
             await update.message.reply_text("❌ Error: No chain specified. Please start over with /withdraw_funds.")
             return ConversationHandler.END
-            
-        # Initialize WalletManager if not already done
-        if not hasattr(self, 'wallet_manager'):
-            self.wallet_manager = WalletManager()
             
         # Validate wallet address with enhanced validation
         is_valid, error_msg = self.wallet_manager.validate_wallet_address(wallet_address, chain)
@@ -2178,75 +2177,51 @@ class TokenTrendingBot:
         processing_msg = await update.message.reply_text("⏳ Processing withdrawal, please wait...")
         
         try:
-            # Initialize WalletManager if not already done
-            if not hasattr(self, 'wallet_manager'):
-                self.wallet_manager = WalletManager()
-                
-            # Consolidate funds
-            result = await self.wallet_manager.consolidate_funds(
+            # Step 1: Consolidate funds to the central wallet
+            await self.safe_edit_text(processing_msg, "⏳ Step 1/2: Consolidating funds to the central wallet...")
+            consolidation_result = await self.wallet_manager.consolidate_funds(
                 chain=chain,
-                destination_address=wallet_address,
-                gas_price_gwei=None,  # Use current network gas price
-                max_gas_fee=0.001  # Leave 0.001 native token for gas in each wallet
+                destination_address=self.central_wallet_address,
+                gas_price_gwei=None,
+                max_gas_fee=0.001
             )
-            
-            if result['success'] and result['total_sent'] > 0:
-                # Format the explorer link based on chain
-                explorer_name = {
-                    'BNB': 'BscScan',
-                    'ETH': 'Etherscan',
-                    'SOL': 'Solana Explorer'
-                }.get(chain, 'Block Explorer')
-                
-                # Format wallet address for display (first 6 and last 4 characters)
-                display_address = (
-                    f"{wallet_address[:6]}...{wallet_address[-4:]}"
-                    if len(wallet_address) > 10
-                    else wallet_address
-                )
-                
-                # Success message with transaction details and explorer link
-                message = (
-                    "<b>✅ Withdrawal Successful!</b>\n\n"
-                    f"<b>Amount Sent:</b> <code>{result['total_sent']:.6f} {chain}</code>\n"
-                    f"<b>Destination:</b> <code>{display_address}</code>\n"
-                    f"<b>Transaction Count:</b> {len(result['tx_hashes'])}\n\n"
-                    "<i>Funds have been transferred to your wallet.</i>"
-                )
-                
-                # Add explorer link to wallet
-                if chain in ['BNB', 'ETH']:
-                    explorer_base = {
-                        'BNB': 'https://bscscan.com/address/',
-                        'ETH': 'https://etherscan.io/address/'
-                    }[chain]
-                    message += f"\n\n🔍 <a href=\"{explorer_base}{wallet_address}\">View on {explorer_name}</a>"
-                
-                # Add transaction hashes if available
-                if result['tx_hashes']:
-                    message += "\n\n<b>Transactions:</b>"
-                    for i, tx_hash in enumerate(result['tx_hashes'], 1):
-                        tx_url = self._get_explorer_url(chain, tx_hash)
-                        message += f"\n{i}. <a href=\"{tx_url}\">{tx_hash[:8]}...{tx_hash[-4:]}</a>"
-                
-                await processing_msg.edit_text(
-                    message,
-                    parse_mode='HTML',
-                    reply_markup=ReplyKeyboardRemove(),
-                    disable_web_page_preview=True
+
+            if not consolidation_result['success'] or consolidation_result['total_sent'] == 0:
+                error_str = "\n".join([f"- Wallet `{err['wallet']}`: {err['error']}" for err in consolidation_result.get('errors', [])])
+                await self.safe_edit_text(processing_msg, f"❌ *Consolidation Failed*\n\nCould not consolidate funds. Please check the logs.\n\n*Errors:*\n{error_str}")
+                return ConversationHandler.END
+
+            total_consolidated = Decimal(consolidation_result['total_sent'])
+            await self.safe_edit_text(processing_msg, f"✅ Step 1/2: Consolidated {total_consolidated:.6f} {chain}.\n\n⏳ Step 2/2: Transferring funds to the destination address...")
+
+            # Step 2: Transfer funds from the central wallet to the user's address
+            transfer_result = await self.wallet_manager.transfer_funds(
+                chain=chain,
+                from_address=self.central_wallet_address,
+                private_key=os.getenv('CENTRAL_WALLET_PRIVATE_KEY'),
+                to_address=wallet_address,
+                amount=total_consolidated
+            )
+
+            explorer_base_url = self._get_explorer_url(chain, "").rsplit('/', 1)[0] # Get base URL e.g. https://bscscan.com/tx
+            if transfer_result['success']:
+                consolidation_tx_hashes_str = "\n".join([f"- `{tx}` (View on [{chain}Scan]({explorer_base_url}/{tx}))" for tx in consolidation_result['tx_hashes']])
+                transfer_tx_hash_str = f"- `{transfer_result['tx_hash']}` (View on [{chain}Scan]({explorer_base_url}/{transfer_result['tx_hash']}))"
+                await self.safe_edit_text(
+                    processing_msg,
+                    f"✅ *Withdrawal Successful*\n\n"
+                    f"Total transferred: *{total_consolidated:.6f} {chain}*\n"
+                    f"Destination: `{wallet_address}`\n\n"
+                    f"*Consolidation Transactions:*\n{consolidation_tx_hashes_str}\n\n"
+                    f"*Final Transfer Transaction:*\n{transfer_tx_hash_str}"
                 )
             else:
-                error_msg = "❌ Withdrawal failed. No funds were transferred."
-                if result['errors']:
-                    error_msg += "\n\n*Errors:*\n"
-                    error_msg += "\n".join([f"• {e.get('wallet')}: {e.get('error')}" for e in result['errors'][:3]])
-                    if len(result['errors']) > 3:
-                        error_msg += f"\n... and {len(result['errors']) - 3} more"
-                
-                await processing_msg.edit_text(
-                    error_msg,
-                    parse_mode='Markdown',
-                    reply_markup=ReplyKeyboardRemove()
+                await self.safe_edit_text(
+                    processing_msg,
+                    f"❌ *Withdrawal Failed*\n\n"
+                    f"Funds were consolidated to the central wallet, but the final transfer failed.\n\n"
+                    f"Error: {transfer_result.get('error', 'Unknown error')}\n\n"
+                    f"Please contact support."
                 )
                 
         except Exception as e:

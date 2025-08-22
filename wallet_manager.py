@@ -437,6 +437,66 @@ class WalletManager:
         result['success'] = len(result['errors']) == 0 or len(result['tx_hashes']) > 0
         self.save_wallets()
         return result
+
+    async def transfer_funds(self, chain: str, from_address: str, private_key: str, to_address: str, amount: Decimal, gas_price_gwei: float = None) -> dict:
+        """
+        Transfer a specific amount of native currency from one address to another.
+        
+        Args:
+            chain: The blockchain network (ETH, BNB)
+            from_address: The address to send funds from
+            private_key: The private key of the sender's wallet
+            to_address: The destination address
+            amount: The amount to send (as a Decimal)
+            gas_price_gwei: Gas price in Gwei
+            
+        Returns:
+            dict: Transaction details including success status, tx_hash, and errors.
+        """
+        chain = chain.upper()
+        if chain not in ['ETH', 'BNB']:
+            return {'success': False, 'error': 'Only ETH and BNB chains are supported'}
+
+        try:
+            from_address = self.w3.to_checksum_address(from_address)
+            to_address = self.w3.to_checksum_address(to_address)
+
+            if gas_price_gwei is None:
+                gas_price_wei = self.w3.eth.gas_price
+            else:
+                gas_price_wei = self.w3.to_wei(gas_price_gwei, 'gwei')
+
+            gas_limit = 21000
+            gas_cost_wei = gas_price_wei * gas_limit
+            
+            balance_wei = await self._get_balance_with_retry(self.w3, from_address)
+            amount_to_send_wei = self.w3.to_wei(amount, 'ether')
+
+            if balance_wei < amount_to_send_wei + gas_cost_wei:
+                return {'success': False, 'error': 'Insufficient funds for transfer and gas fees.'}
+
+            nonce = self.w3.eth.get_transaction_count(from_address)
+            tx = {
+                'nonce': nonce,
+                'to': to_address,
+                'value': amount_to_send_wei,
+                'gas': gas_limit,
+                'gasPrice': gas_price_wei,
+                'chainId': 56 if chain == 'BNB' else 1
+            }
+
+            signed_tx = self.w3.eth.account.sign_transaction(tx, private_key)
+            tx_hash = self.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
+
+            if receipt.status == 1:
+                return {'success': True, 'tx_hash': tx_hash.hex()}
+            else:
+                return {'success': False, 'error': 'Transaction failed', 'tx_hash': tx_hash.hex()}
+
+        except Exception as e:
+            self.logger.error(f"Error in transfer_funds from {from_address}: {str(e)}")
+            return {'success': False, 'error': str(e)}
         
     def validate_wallet_address(self, address: str, chain: str) -> tuple[bool, str]:
         """
