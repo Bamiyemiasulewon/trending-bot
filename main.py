@@ -29,6 +29,21 @@ except ImportError:
         SolanaTradingCycle = None
 from solana.rpc.api import Client as SolClient
 
+# Import WalletManager
+try:
+    # Try absolute import first
+    from wallet_manager import WalletManager
+except ImportError:
+    try:
+        # Then try relative import
+        from .wallet_manager import WalletManager
+    except ImportError:
+        # If both fail, try direct import from the current directory
+        import sys
+        from pathlib import Path
+        sys.path.append(str(Path(__file__).parent))
+        from wallet_manager import WalletManager
+
 # Trending platforms manager
 try:
     from .trending_platforms import TrendingPlatformManager
@@ -59,8 +74,15 @@ class TokenTrendingBot:
         if not self.token:
             raise ValueError("TELEGRAM_TOKEN environment variable not found in .env file")
             
-        # Initialize the application with the bot token
-        self.app = Application.builder().token(self.token).build()
+        # Create the application with tuned HTTP timeouts to reduce startup flakiness
+        request = HTTPXRequest(
+            connect_timeout=20,
+            read_timeout=60,
+            write_timeout=60,
+            pool_timeout=30,
+        )
+        self.app = Application.builder().token(self.token).request(request).build()
+        self.bot = self.app.bot
 
         # This will hold the loaded wallets for the session
         self.wallets = []
@@ -72,22 +94,22 @@ class TokenTrendingBot:
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         )
         self.logger = logging.getLogger(__name__)
+        
+        # Initialize price caches
+        self._bnb_price_cache = {
+            'price': 300.0,  # Default fallback price
+            'timestamp': 0,
+            'ttl': 300  # 5 minutes in seconds
+        }
+        self._price_cache = {
+            'BNB': {'price': self._bnb_price_cache['price'], 'timestamp': 0, 'ttl': 300},
+            'ETH': {'price': 3000.0, 'timestamp': 0, 'ttl': 300},
+        }
+        
         # Trending platforms manager
         self.trending_mgr = TrendingPlatformManager(self.logger)
         # Initialize payment manager if available
         self.payment_mgr = PaymentManager() if 'PaymentManager' in globals() and PaymentManager else None
-        
-        # Initialize native price cache (BNB/ETH)
-        self._price_cache = {
-            'BNB': {'price': 300.0, 'timestamp': 0, 'ttl': 300},
-            'ETH': {'price': 3000.0, 'timestamp': 0, 'ttl': 300},
-        }
-        # Back-compat for get_bnb_price()
-        self._bnb_price_cache = {
-            'price': self._price_cache['BNB']['price'],
-            'timestamp': 0,
-            'ttl': 300
-        }
         
         # Initialize Web3 connection
         self.web3 = None
@@ -98,17 +120,38 @@ class TokenTrendingBot:
             'address': '',
             'chain': '',
             'ticker': '',
-            'total_distributed_bnb': 0.0
+            'total_distributed_bnb': 0.0,
+            'funded_wallets': []
         }
+        # Initialize funded_wallets before loading config
+        self.funded_wallets = []
+        self.total_distributed_bnb = 0.0
+        # Mapping of address -> private_key (populated from wallets file if available)
+        self.wallet_private_keys = {}
         self.load_token_config()
-        # Ensure runtime attribute reflects persisted value
-        try:
-            self.total_distributed_bnb = float(self.token_config.get('total_distributed_bnb', 0.0) or 0.0)
-        except Exception:
-            self.total_distributed_bnb = 0.0
-        # Reflect connected chain if persisted
+        
+        # Initialize connected_chain from config
         self.connected_chain = (self.token_config.get('chain') or '').upper() or None
         
+        # Initialize central wallet with validation
+        self.central_wallet_address = os.getenv('CENTRAL_WALLET_ADDRESS', '').strip()
+        self.central_wallet_private_key = os.getenv('CENTRAL_WALLET_PRIVATE_KEY', '').strip()
+        
+        if not self.central_wallet_address or not self.central_wallet_private_key:
+            self.logger.warning("Central wallet not fully configured. Wallet funding will not work.")
+        elif self.web3 and self.central_wallet_address:
+            try:
+                # Validate wallet address format
+                if not self.web3.is_address(self.central_wallet_address):
+                    self.logger.error(f"Invalid wallet address format: {self.central_wallet_address}")
+                    self.central_wallet_address = ''
+                else:
+                    # Convert to checksum address
+                    self.central_wallet_address = self.web3.to_checksum_address(self.central_wallet_address)
+                    self.logger.info(f"Central wallet configured: {self.central_wallet_address}")
+            except Exception as e:
+                self.logger.error(f"Error validating central wallet: {str(e)}")
+                self.central_wallet_address = ''
         # Load wallets if we have a connected chain
         if self.connected_chain:
             self.logger.info(f"Loading wallets for chain: {self.connected_chain}")
@@ -148,6 +191,8 @@ class TokenTrendingBot:
                         self.logger.info(f"Loaded {len(self.wallets)} wallets")
             except Exception as e:
                 self.logger.error(f"Error loading wallets for chain {self.connected_chain}: {e}", exc_info=True)
+
+        self.register_handlers()
 
     # ---- Helpers for USD-based min wallet balance ----
     def _get_env_min_wallet_balance_usd(self) -> float:
@@ -653,73 +698,8 @@ class TokenTrendingBot:
 
         return {'address': addr, 'private_key': key}
 
-    def __init__(self):
-        """Initializes the bot, loads configuration, and sets up handlers."""
-        # Load environment variables from project root .env file
-        env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
-        if os.path.exists(env_path):
-            load_dotenv(env_path, override=True)
-        else:
-            load_dotenv(override=True)  # Fallback to default .env location
-            
-        self.token = os.getenv("TELEGRAM_TOKEN")
-        if not self.token:
-            raise ValueError("TELEGRAM_TOKEN environment variable not found in .env file")
-            
-        # Create the application with tuned HTTP timeouts to reduce startup flakiness
-        request = HTTPXRequest(
-            connect_timeout=20,
-            read_timeout=60,
-            write_timeout=60,
-            pool_timeout=30,
-        )
-        self.app = Application.builder().token(self.token).request(request).build()
-        self.bot = self.app.bot
-            
-        # This will hold the loaded wallets for the session
-        self.wallets = []
-        self.trading_cycle = None
-        
-        # Configure logging
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        )
-        self.logger = logging.getLogger(__name__)
-        
-        # Initialize price caches
-        self._bnb_price_cache = {
-            'price': 300.0,  # Default fallback price
-            'timestamp': 0,
-            'ttl': 300  # 5 minutes in seconds
-        }
-        self._price_cache = {
-            'BNB': {'price': self._bnb_price_cache['price'], 'timestamp': 0, 'ttl': 300},
-            'ETH': {'price': 3000.0, 'timestamp': 0, 'ttl': 300},
-        }
-        
-        # Simple and reliable Web3 connection
-        self.logger.info("Initializing Web3 connection...")
-        
-        # Initialize Web3 connection
-        self.web3 = None
-        self.initialize_web3()
-        
-        # Initialize token configuration
-        self.token_config = {
-            'address': '',
-            'chain': '',
-            'ticker': '',
-            'funded_wallets': [],
-            'total_distributed_bnb': 0.0
-        }
-        # Initialize funded_wallets before loading config
-        self.funded_wallets = []
-        self.total_distributed_bnb = 0.0
-        # Mapping of address -> private_key (populated from wallets file if available)
-        self.wallet_private_keys: dict[str, str] = {}
-        self.load_token_config()
-
+    def register_handlers(self):
+        """Register all command and message handlers."""
         # Register command handlers
         self.app.add_handler(CommandHandler("start", self.start))
         self.app.add_handler(CommandHandler("menu", self.menu))
@@ -736,25 +716,13 @@ class TokenTrendingBot:
         
         # Set up conversation handler for withdrawals
         withdrawal_conv_handler = ConversationHandler(
-            entry_points=[CommandHandler("withdraw_funds", self.withdraw_funds)],
+            entry_points=[CommandHandler("withdraw", self.withdraw_funds)],
             states={
-                'AWAITING_WALLET_ADDRESS': [
-                    MessageHandler(
-                        filters.TEXT & ~filters.COMMAND,
-                        self.handle_withdraw_address
-                    )
-                ],
-                'CONFIRM_WITHDRAWAL': [
-                    MessageHandler(
-                        filters.TEXT & ~filters.COMMAND,
-                        self.confirm_withdrawal
-                    )
-                ],
+                'AWAITING_WALLET_ADDRESS': [MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_withdraw_address)],
+                'CONFIRM_WITHDRAWAL': [MessageHandler(filters.TEXT & ~filters.COMMAND, self.confirm_withdrawal)],
             },
-            fallbacks=[
-                CommandHandler("cancel", self.cancel),
-                MessageHandler(filters.COMMAND, self.cancel)
-            ],
+            fallbacks=[CommandHandler("cancel", self.cancel)],
+            conversation_timeout=300,
         )
         
         self.app.add_handler(withdrawal_conv_handler)
@@ -767,29 +735,6 @@ class TokenTrendingBot:
             filters.TEXT & ~filters.COMMAND,
             self.handle_interactive_messages
         ))
-        
-        # Initialize connected_chain from config
-        self.connected_chain = (self.token_config.get('chain') or '').upper() or None
-        
-        # Initialize central wallet with validation
-        self.central_wallet_address = os.getenv('CENTRAL_WALLET_ADDRESS', '').strip()
-        self.central_wallet_private_key = os.getenv('CENTRAL_WALLET_PRIVATE_KEY', '').strip()
-        
-        if not self.central_wallet_address or not self.central_wallet_private_key:
-            self.logger.warning("Central wallet not fully configured. Wallet funding will not work.")
-        elif self.web3 and self.central_wallet_address:
-            try:
-                # Validate wallet address format
-                if not self.web3.is_address(self.central_wallet_address):
-                    self.logger.error(f"Invalid wallet address format: {self.central_wallet_address}")
-                    self.central_wallet_address = ''
-                else:
-                    # Convert to checksum address
-                    self.central_wallet_address = self.web3.to_checksum_address(self.central_wallet_address)
-                    self.logger.info(f"Central wallet configured: {self.central_wallet_address}")
-            except Exception as e:
-                self.logger.error(f"Error validating central wallet: {str(e)}")
-                self.central_wallet_address = ''
 
     async def on_error(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Global error handler: log exception and notify user briefly."""
@@ -1664,7 +1609,20 @@ class TokenTrendingBot:
             return
         """Show number of generated wallets, count funded, and total distributed."""
         try:
-            generated = len(self.wallets) if isinstance(self.wallets, list) else 0
+            # Ensure wallets is a list of dicts
+            if not hasattr(self, 'wallets') or not isinstance(self.wallets, list):
+                self.wallets = []
+            
+            # Convert any string wallets to dict format
+            normalized_wallets = []
+            for w in self.wallets:
+                if isinstance(w, str):
+                    normalized_wallets.append({'address': w.strip()})
+                elif isinstance(w, dict):
+                    normalized_wallets.append(w)
+            
+            generated = len(normalized_wallets)
+            self.wallets = normalized_wallets  # Update with normalized data
 
             # Ensure attributes exist
             if not hasattr(self, 'funded_wallets') or not isinstance(self.funded_wallets, list):
@@ -1683,14 +1641,27 @@ class TokenTrendingBot:
                     total_detected_balance = 0.0
 
                     for wallet in self.wallets:
-                        addr = (wallet.get('address') if isinstance(wallet, dict) else str(wallet)).strip()
-                        if not addr:
-                            continue
                         try:
+                            # Handle both string and dict wallet formats
+                            if isinstance(wallet, str):
+                                addr = wallet.strip()
+                                wallet_obj = {'address': addr}
+                            elif isinstance(wallet, dict):
+                                addr = wallet.get('address', '')
+                                wallet_obj = wallet
+                            else:
+                                continue
+                                
+                            if not addr:
+                                continue
+                                
+                            # Get balance and check if it meets minimum
                             wei = await self._get_balance_with_retry(w3, addr)
                             bal = float(w3.from_wei(wei, 'ether'))
                             if bal >= float(min_balance):
-                                funded_detected.append({'address': addr, 'balance': bal})
+                                # Include any additional wallet data in the result
+                                result = {'address': addr, 'balance': bal, **wallet_obj}
+                                funded_detected.append(result)
                                 total_detected_balance += bal
                         except Exception as e:
                             self.logger.warning(f"wallet_status: balance check failed for {addr}: {e}")
@@ -1708,17 +1679,32 @@ class TokenTrendingBot:
             funded_count = len(funded_list)
             total_bnb_distributed = float(self.total_distributed_bnb or 0.0)
 
-            # Build summary, including a quick preview of detected funded wallets (Option A)
+            # Build summary, including a quick preview of detected funded wallets
             preview = ''
             if funded_list:
-                top = funded_list[:3]
+                top = funded_list[:3]  # Show first 3 funded wallets
                 lines = []
+                
                 for w in top:
-                    addr = w.get('address', '')
-                    bal = float(w.get('balance', 0.0) or 0.0)
-                    lines.append(f"• <code>{addr[:6]}...{addr[-4:]}</code> — {bal:.4f} BNB")
-                more = f"\n• ...and {len(funded_list) - len(top)} more" if len(funded_list) > len(top) else ''
-                preview = "\n\n<b>Detected funded wallets</b>:\n" + "\n".join(lines) + more
+                    try:
+                        # Handle both dictionary and string wallet formats
+                        if isinstance(w, dict):
+                            addr = str(w.get('address', '')).strip()
+                            bal = float(w.get('balance', 0.0) or 0.0)
+                        else:
+                            # If it's a string, use it as the address with 0 balance
+                            addr = str(w).strip()
+                            bal = 0.0
+                        
+                        if addr:  # Only add if we have a valid address
+                            lines.append(f"• <code>{addr[:6]}...{addr[-4:]}</code> — {bal:.4f} BNB")
+                    except Exception as e:
+                        self.logger.warning(f"Error formatting wallet preview for {w}: {e}")
+                
+                # Only show preview if we have valid wallet entries
+                if lines:
+                    more = f"\n• ...and {len(funded_list) - len(top)} more" if len(funded_list) > len(top) else ''
+                    preview = "\n\n<b>Detected funded wallets</b>:\n" + "\n".join(lines) + more
 
             self.logger.info(
                 f"Wallet Status - Generated: {generated}, Funded: {funded_count}, Total Distributed BNB: {total_bnb_distributed:.6f}"
@@ -1788,12 +1774,9 @@ class TokenTrendingBot:
             await self.safe_reply_text(update, "❌ Please use /connect to set token details before starting a trend (required each session).")
             return
 
+
         """Start trading/trending after comprehensive pre-flight checks."""
         try:
-            # Initialize payment tracking if not exists
-            if 'payment_id' not in context.user_data:
-                context.user_data['payment_id'] = str(uuid.uuid4())
-                self.logger.info(f"Initialized new payment_id: {context.user_data['payment_id']}")
             
             # Send initial status message
             status_msg = await self.safe_reply_text(update, "🔍 Starting pre-flight checks...")

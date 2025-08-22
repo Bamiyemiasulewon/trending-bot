@@ -2,6 +2,8 @@
   "address": "0x32B407ee915432Be6D3F168bc1eFf2a6F8b2034C",
   "chain": "BNB",
   "ticker": "$HODL",
-  "funded_wallets": [],
-  "total_distributed_bnb": 0.0
+  "funded_wallets": [
+    "0x0E92fa8441e1Bc2C8d8acc9a941c214d945C11A0"
+  ],
+  "total_distributed_bnb": 0.0035441303294859827
 }

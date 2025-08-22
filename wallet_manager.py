@@ -9,7 +9,7 @@ from decimal import Decimal
 from web3 import Web3, HTTPProvider
 # POA middleware is included by default in web3.py v7 for BSC
 from eth_account import Account
-from eth_abi import encode_abi
+from eth_abi import encode
 from hexbytes import HexBytes
 from dotenv import load_dotenv
 
