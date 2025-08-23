@@ -2075,9 +2075,15 @@ class TokenTrendingBot:
             )
             return ConversationHandler.END
             
-        # Check total available balance
-        balance_info = self.wallet_manager.get_total_balance(self.connected_chain)
-        
+        # Refresh and get total balance across all wallets
+        try:
+            balance_info = await self.wallet_manager.get_total_balance(self.connected_chain, refresh=True)
+            self.logger.info(f"Total available balance for withdrawal: {balance_info.get('total_balance', 0)} {self.connected_chain}")
+        except Exception as e:
+            self.logger.error(f"Failed to get total balance: {e}")
+            await update.message.reply_text("❌ Error getting wallet balances. Please try again later.")
+            return ConversationHandler.END
+
         if balance_info['total_balance'] <= 0:
             await update.message.reply_text(
                 "❌ No funds available for withdrawal."
