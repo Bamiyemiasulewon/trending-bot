@@ -219,6 +219,49 @@ class WalletManager:
         
         return result
     
+    def get_total_balance(self, chain: str, refresh: bool = False) -> dict:
+        """
+        Get the total balance of all wallets for a specific chain.
+        
+        Args:
+            chain: The blockchain network (e.g., 'BNB')
+            refresh: If True, forces a refresh of wallet balances from the blockchain
+            
+        Returns:
+            dict: A dictionary containing:
+                - 'total_balance': The sum of balances across all wallets.
+                - 'wallet_count': The number of wallets with a balance greater than zero.
+                - 'wallets': A list of wallet dictionaries with balances.
+        """
+        chain = chain.upper()
+        if chain not in self.wallets:
+            raise ValueError(f"Unsupported chain: {chain}")
+
+        # Set minimum balance threshold to 0.001 BNB
+        min_balance = 0.001
+
+        if refresh:
+            try:
+                self.check_wallet_balances(chain, min_balance=min_balance)
+            except Exception as e:
+                self.logger.error(f"Failed to refresh wallet balances for {chain}: {e}")
+                # Return zero balance if refresh fails to avoid using stale data
+                return {'total_balance': 0.0, 'wallet_count': 0, 'wallets': []}
+
+        # Get all wallets with balance >= min_balance
+        wallets_with_balance = [
+            w for w in self.wallets.get(chain, [])
+            if isinstance(w.get('balance'), (int, float)) and w['balance'] >= min_balance
+        ]
+        
+        total_balance = sum(w['balance'] for w in wallets_with_balance)
+        
+        return {
+            'total_balance': total_balance,
+            'wallet_count': len(wallets_with_balance),
+            'wallets': wallets_with_balance
+        }
+        
     def _get_balance_with_retry(self, w3, address: str, retries: int = 3, delay: int = 2) -> int:
         """Get balance with retry logic."""
         last_exception = None
@@ -238,49 +281,11 @@ class WalletManager:
         if chain not in self.wallets:
             raise ValueError(f"Unsupported chain: {chain}")
             
+        # Get all wallets with balance >= min_balance
         return [
-            w for w in self.wallets[chain] 
+            w for w in self.wallets.get(chain, [])
             if isinstance(w.get('balance'), (int, float)) and w['balance'] >= min_balance
         ]
-
-    def get_total_balance(self, chain: str, refresh: bool = False) -> dict:
-        """
-        Get the total balance of all wallets for a specific chain.
-
-        Args:
-            chain (str): The blockchain network (e.g., 'BNB').
-            refresh (bool): If True, forces a refresh of wallet balances from the blockchain.
-
-        Returns:
-            dict: A dictionary containing:
-                - 'total_balance': The sum of balances across all wallets.
-                - 'wallet_count': The number of wallets with a balance greater than zero.
-                - 'wallets': A list of wallet dictionaries with balances.
-        """
-        chain = chain.upper()
-        if chain not in self.wallets:
-            raise ValueError(f"Unsupported chain: {chain}")
-
-        if refresh:
-            try:
-                self.check_wallet_balances(chain)
-            except Exception as e:
-                self.logger.error(f"Failed to refresh wallet balances for {chain}: {e}")
-                # Return zero balance if refresh fails to avoid using stale data
-                return {'total_balance': 0.0, 'wallet_count': 0, 'wallets': []}
-
-        wallets_with_balance = [
-            w for w in self.wallets.get(chain, [])
-            if isinstance(w.get('balance'), (int, float)) and w['balance'] > 0
-        ]
-        
-        total_balance = sum(w['balance'] for w in wallets_with_balance)
-        
-        return {
-            'total_balance': total_balance,
-            'wallet_count': len(wallets_with_balance),
-            'wallets': wallets_with_balance
-        }
         
     def get_total_distributed(self, chain: str) -> float:
         """Get total distributed amount for a chain"""
