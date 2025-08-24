@@ -3,6 +3,7 @@ import json
 import logging
 import asyncio
 import time
+import aiohttp
 import uuid
 import requests
 from decimal import Decimal
@@ -160,42 +161,46 @@ class TokenTrendingBot:
         if self.connected_chain:
             self.logger.info(f"Loading wallets for chain: {self.connected_chain}")
             try:
+                # Define possible wallet file locations in order of preference
+                possible_paths = []
+                
                 if self.connected_chain == 'BNB':
-                    # Look for wallets in the project root's hardhat-scripts directory
-                    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                    wallets_file_path = os.path.join(project_root, 'hardhat-scripts', 'wallets.json')
-                    self.logger.info(f"Looking for BNB wallets at: {wallets_file_path}")
-                    # Fall back to bsc_wallets.json if it exists and wallets.json doesn't
-                    if not os.path.exists(wallets_file_path):
-                        self.logger.info(f"Primary wallet file not found, checking for fallback...")
-                        fallback_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bsc_wallets.json')
-                        self.logger.info(f"Checking fallback path: {fallback_path}")
-                        if os.path.exists(fallback_path):
-                            wallets_file_path = fallback_path
-                            self.logger.info(f"Using fallback wallet file: {wallets_file_path}")
-                elif self.connected_chain == 'ETH':
-                    wallets_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'eth_wallet.json')
-                    self.logger.info(f"Looking for ETH wallets at: {wallets_file_path}")
-                elif self.connected_chain == 'SOL':
-                    wallets_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sol_wallet.json')
-                    self.logger.info(f"Looking for SOL wallets at: {wallets_file_path}")
+                    # 1. In the parent directory's hardhat-scripts folder (preferred location)
+                    hardhat_wallets_path = os.path.join(
+                        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 
+                        'hardhat-scripts', 
+                        'wallets.json'
+                    )
+                    possible_paths.append(hardhat_wallets_path)
+                    
+                    # 2. In the same directory as main.py
+                    possible_paths.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bsc_wallets.json'))
+                    
+                    # 3. In the current working directory
+                    possible_paths.append(os.path.join(os.getcwd(), 'bsc_wallets.json'))
                 else:
-                    self.logger.warning(f"Unsupported chain for wallet loading: {self.connected_chain}")
+                    # For other chains, just check the standard location
+                    filename = f"{self.connected_chain.lower()}_wallet.json"
+                    possible_paths.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), filename))
+                
+                # Try each path in order
+                wallets_file_path = None
+                for path in possible_paths:
+                    if os.path.exists(path):
+                        wallets_file_path = os.path.normpath(path)
+                        self.logger.info(f"Found wallet file at: {wallets_file_path}")
+                        break
+                
+                if not wallets_file_path:
+                    self.logger.warning(f"No wallet file found in any of these locations: {', '.join(possible_paths)}")
                     return
                 
-                wallets_file_path = os.path.normpath(wallets_file_path)
-                self.logger.info(f"Final wallet file path: {wallets_file_path}")
-                
-                if os.path.exists(wallets_file_path):
-                    self.logger.info(f"Wallet file exists, attempting to load...")
-                    with open(wallets_file_path, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                        # Normalize list of dicts {address, private_key?}
-                        self.wallets = data if isinstance(data, list) else []
-                        self.logger.info(f"Loaded {len(self.wallets)} wallets")
-                        # Pass wallets to WalletManager
-                        if self.wallet_manager:
-                            self.wallet_manager.wallets[self.connected_chain] = self.wallets
+                # Set the wallet file path for WalletManager
+                if self.wallet_manager:
+                    self.wallet_manager.config_path = wallets_file_path
+                    self.wallet_manager.load_wallets()
+                    self.wallets = self.wallet_manager.wallets.get(self.connected_chain, [])
+                    self.logger.info(f"Loaded {len(self.wallets)} {self.connected_chain} wallets from {wallets_file_path}")
             except Exception as e:
                 self.logger.error(f"Error loading wallets for chain {self.connected_chain}: {e}", exc_info=True)
 
@@ -845,74 +850,90 @@ class TokenTrendingBot:
         return detected
 
     async def get_bnb_price(self):
-        """Fetch the current BNB price in USD with caching and async requests."""
+        """
+        Fetch the current BNB price in USD with caching, retries, and multiple fallback sources.
+        Returns a tuple of (price, source_name)
+        """
         current_time = time.time()
         
-        # Return cached price if still valid
-        if current_time - self._bnb_price_cache['timestamp'] < self._bnb_price_cache['ttl']:
-            return self._bnb_price_cache['price']
-            
-        # Define price sources with their URLs and parsers
+        # Check cache first (5-minute TTL)
+        if hasattr(self, '_bnb_price_cache') and current_time - self._bnb_price_cache.get('timestamp', 0) < 300:
+            return self._bnb_price_cache['price'], 'cache'
+
+        # List of price sources with their respective URLs and parsers
         price_sources = [
             {
-                'url': 'https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT',
-                'parser': lambda d: float(d['price'])
-            },
-            {
-                'url': 'https://api.coingecko.com/api/v3/simple/price?ids=binancecoin&vs_currencies=usd',
-                'parser': lambda d: float(d['binancecoin']['usd'])
-            },
-            {
+                'name': 'PancakeSwap',
                 'url': 'https://api.pancakeswap.info/api/v2/tokens/0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c',
-                'parser': lambda d: float(d['data']['price'])
+                'parser': lambda data: float(data['data']['price'])
+            },
+            {
+                'name': 'CoinGecko',
+                'url': 'https://api.coingecko.com/api/v3/simple/price?ids=binancecoin&vs_currencies=usd',
+                'parser': lambda data: float(data['binancecoin']['usd'])
+            },
+            {
+                'name': 'Binance',
+                'url': 'https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT',
+                'parser': lambda data: float(data['price'])
             }
         ]
-        
-        # Create a session and fetch all prices in parallel
+
+        async def fetch_price(session, source):
+            try:
+                async with session.get(source['url'], timeout=10) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return source['parser'](data), source['name']
+                    return None, None
+            except Exception as e:
+                self.logger.warning(f"Error fetching BNB price from {source['name']}: {str(e)}")
+                return None, None
+
+        async def try_sources():
+            async with aiohttp.ClientSession() as session:
+                tasks = [fetch_price(session, source) for source in price_sources]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Find first successful result
+                for result in results:
+                    if isinstance(result, tuple) and len(result) == 2 and result[0] is not None:
+                        price, source = result
+                        if price > 0:
+                            return price, source
+                return None, None
+
         try:
-            import aiohttp
-            import asyncio
+            # Try to get price from any source
+            price, source = await try_sources()
             
-            async with aiohttp.ClientSession(headers={'User-Agent': 'Mozilla/5.0'}) as session:
-                tasks = [
-                    self._fetch_bnb_price_async(session, source['url'], source['parser'])
-                    for source in price_sources
-                ]
+            if price is not None:
+                # Update cache
+                self._bnb_price_cache = {
+                    'price': price,
+                    'timestamp': current_time,
+                    'source': source,
+                    'ttl': 300  # 5 minutes in seconds
+                }
+                self.logger.info(f"Fetched BNB price: ${price:.2f} from {source}")
+                return price, source
                 
-                # Wait for the first successful response with a timeout of 3 seconds
-                done, pending = await asyncio.wait(
-                    [asyncio.create_task(t) for t in tasks],
-                    return_when=asyncio.FIRST_COMPLETED,
-                    timeout=3.0
-                )
+            # If all sources fail, use cache even if expired
+            if hasattr(self, '_bnb_price_cache') and self._bnb_price_cache:
+                self.logger.warning("All price sources failed, using expired cache")
+                return self._bnb_price_cache['price'], f"{self._bnb_price_cache.get('source', 'cached')} (stale)"
                 
-                # Get the first successful result
-                for task in done:
-                    result = await task
-                    if result is not None:
-                        # Update cache
-                        self._bnb_price_cache = {
-                            'price': result,
-                            'timestamp': current_time,
-                            'ttl': 300  # 5 minutes
-                        }
-                        return result
-                        
+            # If no cache exists, return a safe default
+            self.logger.error("All price sources failed and no cache available")
+            return 300.0, 'default'
+            
         except Exception as e:
-            self.logger.warning(f"Async price fetch failed: {str(e)}")
-        
-        # Return cached price if available, otherwise fallback
-        return self._bnb_price_cache['price']
+            self.logger.error(f"Unexpected error in get_bnb_price: {str(e)}")
+            if hasattr(self, '_bnb_price_cache') and self._bnb_price_cache:
+                return self._bnb_price_cache['price'], f"{self._bnb_price_cache.get('source', 'cached')} (error)"
+            return 300.0, 'error_default'
 
     async def fund_wallet(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # Enforce /connect in current session
-        if not context.user_data.get('token_connected', False):
-            await self.safe_reply_text(update, "❌ Please use /connect to set token details before using this command (required each session).")
-            return
-        # Enforce /connect in current session
-        if not context.user_data.get('token_connected', False):
-            await self.safe_reply_text(update, "❌ Please use /connect to set token details before using this command (required each session).")
-            return
         """Show the correct central wallet for the connected chain and its current balance."""
         try:
             chain = getattr(self, 'connected_chain', None) or self.token_config.get('chain')
@@ -923,14 +944,17 @@ class TokenTrendingBot:
             cw = self.get_central_wallet(chain)
             address = (cw.get('address') or '').strip()
             pkey = (cw.get('private_key') or '').strip()
+
             if not address or not pkey:
                 await self.safe_reply_text(
                     update,
                     f"❌ Central wallet for {chain} not configured. Please set the appropriate environment variables.")
                 return
 
-            # Get current token price for USD conversion
-            bnb_price = await self.get_bnb_price()
+            # Get current token price for USD conversion - returns (price, source)
+            bnb_price, _ = await self.get_bnb_price()
+            if not isinstance(bnb_price, (int, float)):
+                bnb_price = 0.0
 
             # Show loading with the address
             loading_message = await self.safe_reply_text(
@@ -1482,7 +1506,7 @@ class TokenTrendingBot:
                 return
 
             # Get BNB price
-            bnb_price = await self.get_bnb_price()
+            bnb_price, source = await self.get_bnb_price()
             if not bnb_price:
                 await self.safe_reply_text(update, "❌ Could not fetch BNB price. Try again later.")
                 return
@@ -1495,7 +1519,7 @@ class TokenTrendingBot:
                 checksum = address
             balance_wei = w3.eth.get_balance(checksum)
             balance_bnb = float(w3.from_wei(balance_wei, 'ether'))
-            balance_usd = balance_bnb * bnb_price
+            balance_usd = balance_bnb * float(bnb_price)
 
             # Read configurable funding parameters (clamped to exactly $1.00 as policy)
             def _parse_float(env_key: str, default: float) -> float:
@@ -1579,7 +1603,7 @@ class TokenTrendingBot:
 
             if chain in {'BNB', 'ETH'}:
                 # Fetch price for USD display when on EVM
-                bnb_price = await self.get_bnb_price()
+                bnb_price, source = await self.get_bnb_price()
                 if not bnb_price:
                     raise ValueError("Could not fetch BNB price")
                 w3 = self.get_web3_for_chain(chain)

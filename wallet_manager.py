@@ -87,9 +87,23 @@ class WalletManager:
         if os.path.exists(self.config_path):
             try:
                 with open(self.config_path, 'r') as f:
-                    self.wallets = json.load(f)
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        # Convert from hardhat format to our format
+                        self.wallets['BNB'] = [
+                            {
+                                'address': w['address'].lower(),
+                                'private_key': w['privateKey'].replace('0x', '')
+                            }
+                            for w in data
+                            if 'address' in w and 'privateKey' in w
+                        ]
+                        self.logger.info(f"Loaded {len(self.wallets['BNB'])} wallets from {self.config_path}")
+                    else:
+                        self.wallets = data  # Use as is if already in our format
             except Exception as e:
-                logging.error(f"Failed to load wallet config: {str(e)}")
+                self.logger.error(f"Failed to load wallet config: {str(e)}")
+                self.wallets = {'BNB': []}
                 
     def save_wallets(self):
         """Save wallet configurations to file"""
@@ -265,9 +279,11 @@ class WalletManager:
     def _get_balance_with_retry(self, w3, address: str, retries: int = 3, delay: int = 2) -> int:
         """Get balance with retry logic."""
         last_exception = None
+        # Ensure address is in checksum format
+        checksum_address = w3.to_checksum_address(address)
         for attempt in range(retries):
             try:
-                return w3.eth.get_balance(address)
+                return w3.eth.get_balance(checksum_address)
             except Exception as e:
                 last_exception = e
                 self.logger.warning(f"Attempt {attempt + 1} failed for {address}: {e}")
