@@ -80,6 +80,7 @@ class TokenTrendingBot:
             read_timeout=60,
             write_timeout=60,
             pool_timeout=30,
+            http_version="1.1",
         )
         self.app = Application.builder().token(self.token).request(request).build()
         self.bot = self.app.bot
@@ -2077,7 +2078,7 @@ class TokenTrendingBot:
             
         # Refresh and get total balance across all wallets
         try:
-            balance_info = await self.wallet_manager.get_total_balance(self.connected_chain, refresh=True)
+            balance_info = self.wallet_manager.get_total_balance(self.connected_chain, refresh=True)
             self.logger.info(f"Total available balance for withdrawal: {balance_info.get('total_balance', 0)} {self.connected_chain}")
         except Exception as e:
             self.logger.error(f"Failed to get total balance: {e}")

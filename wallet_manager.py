@@ -150,7 +150,7 @@ class WalletManager:
             
         return len(self.wallets[chain])
         
-    async def check_wallet_balances(self, chain: str, provider_url: str = None, min_balance: float = 0.00085) -> dict:
+    def check_wallet_balances(self, chain: str, provider_url: str = None, min_balance: float = 0.00085) -> dict:
         """Check and update balances for all wallets with detailed reporting.
         
         Args:
@@ -164,53 +164,51 @@ class WalletManager:
         chain = chain.upper()
         if chain not in self.wallets:
             raise ValueError(f"Unsupported chain: {chain}")
-        
-        w3 = Web3(HTTPProvider(provider_url)) if provider_url else self.w3
-        
+            
+        # Use provided provider or default to instance's Web3
+        w3 = self.w3
+        if provider_url:
+            w3 = Web3(HTTPProvider(provider_url))
+            
         result = {
+            'chain': chain,
             'total_wallets': len(self.wallets[chain]),
             'funded_wallets': 0,
             'total_balance': 0.0,
-            'low_balance_wallets': [],
-            'error_wallets': [],
-            'active_wallets': [],
+            'min_balance': min_balance,
             'wallets': []
         }
         
         try:
-            if chain in ['ETH', 'BNB']:
-                w3 = Web3(Web3.HTTPProvider(provider_url)) if provider_url else self.w3
-                if not w3.is_connected():
-                    raise ConnectionError("Failed to connect to Web3 provider")
+            for wallet in self.wallets[chain]:
+                wallet_info = {
+                    'address': wallet['address'],
+                    'balance': 0.0,
+                    'is_funded': False,
+                    'error': None
+                }
+                
+                try:
+                    # Get balance with retry logic
+                    balance_wei = self._get_balance_with_retry(w3, wallet['address'])
+                    balance = w3.from_wei(balance_wei, 'ether')
                     
-                for wallet in self.wallets[chain]:
-                    wallet_info = wallet.copy()
-                    try:
-                        # Get balance with retry logic
-                        balance_wei = await self._get_balance_with_retry(w3, wallet['address'])
-                        balance = float(w3.from_wei(balance_wei, 'ether'))
+                    # Update wallet info
+                    wallet['balance'] = float(balance)
+                    wallet_info['balance'] = float(balance)
+                    wallet_info['is_funded'] = balance >= min_balance
+                    
+                    # Update result counters
+                    if wallet_info['is_funded']:
+                        result['funded_wallets'] += 1
+                        result['total_balance'] += float(balance)
                         
-                        # Update wallet info
-                        wallet['balance'] = balance # Update the actual wallet object
-                        wallet_info['balance'] = balance
-                        wallet_info['is_funded'] = balance >= min_balance
-                        
-                        # Update result counters
-                        if wallet_info['is_funded']:
-                            result['funded_wallets'] += 1
-                            result['total_balance'] += balance
-                            
-                    except Exception as e:
-                        self.logger.error(f"Error checking balance for {wallet['address']}: {str(e)}")
-                        wallet_info['error'] = str(e)
-                        wallet_info['is_funded'] = False
-                        raise # Re-raise the exception to signal failure to the caller
+                except Exception as e:
+                    self.logger.error(f"Error checking balance for {wallet['address']}: {str(e)}")
+                    wallet_info['error'] = str(e)
+                    wallet_info['is_funded'] = False
                     
-                    result['wallets'].append(wallet_info)
-                    
-            elif chain == 'SOL':
-                # TODO: Implement Solana balance checking
-                pass
+                result['wallets'].append(wallet_info)
                 
             # Save updated balances
             self.save_wallets()
@@ -221,16 +219,17 @@ class WalletManager:
         
         return result
     
-    async def _get_balance_with_retry(self, w3, address: str, retries: int = 3, delay: int = 2) -> int:
+    def _get_balance_with_retry(self, w3, address: str, retries: int = 3, delay: int = 2) -> int:
         """Get balance with retry logic."""
         last_exception = None
         for attempt in range(retries):
             try:
-                return await w3.eth.get_balance(address)
+                return w3.eth.get_balance(address)
             except Exception as e:
                 last_exception = e
                 self.logger.warning(f"Attempt {attempt + 1} failed for {address}: {e}")
-                await asyncio.sleep(delay)
+                # Use synchronous sleep since this is not an async context
+                time.sleep(delay)
         raise last_exception
 
     def get_funded_wallets(self, chain: str, min_balance: float = 0.00085) -> List[Dict]:
@@ -243,6 +242,45 @@ class WalletManager:
             w for w in self.wallets[chain] 
             if isinstance(w.get('balance'), (int, float)) and w['balance'] >= min_balance
         ]
+
+    def get_total_balance(self, chain: str, refresh: bool = False) -> dict:
+        """
+        Get the total balance of all wallets for a specific chain.
+
+        Args:
+            chain (str): The blockchain network (e.g., 'BNB').
+            refresh (bool): If True, forces a refresh of wallet balances from the blockchain.
+
+        Returns:
+            dict: A dictionary containing:
+                - 'total_balance': The sum of balances across all wallets.
+                - 'wallet_count': The number of wallets with a balance greater than zero.
+                - 'wallets': A list of wallet dictionaries with balances.
+        """
+        chain = chain.upper()
+        if chain not in self.wallets:
+            raise ValueError(f"Unsupported chain: {chain}")
+
+        if refresh:
+            try:
+                self.check_wallet_balances(chain)
+            except Exception as e:
+                self.logger.error(f"Failed to refresh wallet balances for {chain}: {e}")
+                # Return zero balance if refresh fails to avoid using stale data
+                return {'total_balance': 0.0, 'wallet_count': 0, 'wallets': []}
+
+        wallets_with_balance = [
+            w for w in self.wallets.get(chain, [])
+            if isinstance(w.get('balance'), (int, float)) and w['balance'] > 0
+        ]
+        
+        total_balance = sum(w['balance'] for w in wallets_with_balance)
+        
+        return {
+            'total_balance': total_balance,
+            'wallet_count': len(wallets_with_balance),
+            'wallets': wallets_with_balance
+        }
         
     def get_total_distributed(self, chain: str) -> float:
         """Get total distributed amount for a chain"""
@@ -265,50 +303,17 @@ class WalletManager:
         # Update last used timestamp for wallets
         current_time = time.time()
         for wallet in self.wallets[chain]:
-            if wallet['address'] in used_addresses:
-                wallet['last_used'] = current_time
+            pass
                 
-        self.save_wallets()
-
-    async def get_total_balance(self, chain: str, refresh: bool = False) -> dict:
-        """
-        Get total balance across all wallets for a specific chain. Can refresh balances from the blockchain.
-
-        Args:
-            chain: The blockchain network (ETH, BNB, SOL).
-            refresh: If True, fetches the latest balances from the blockchain before calculating the total.
-
-        Returns:
-            dict: A dictionary containing the total balance, the count of wallets with a positive balance,
-                  and a list of those wallets.
-        """
+    def get_wallet_count(self, chain: str) -> int:
+        """Get the number of wallets for a specific chain"""
         chain = chain.upper()
-
-        if refresh:
-            try:
-                await self.check_wallet_balances(chain)
-            except Exception as e:
-                self.logger.error(f"Failed to refresh balances for {chain}: {e}")
-                # Return a zeroed-out dict to prevent using stale data on failure
-                return {'total_balance': 0.0, 'wallet_count': 0, 'wallets': []}
-
-        result = {'total_balance': 0.0, 'wallet_count': 0, 'wallets': []}
-        wallets_to_check = self.wallets.get(chain, [])
-
-        for wallet in wallets_to_check:
-            balance = wallet.get('balance', 0)
-            if isinstance(balance, (int, float)) and balance > 0:
-                result['total_balance'] += balance
-                result['wallet_count'] += 1
-                result['wallets'].append({
-                    'address': wallet.get('address'),
-                    'balance': balance
-                })
-
-        return result
-
-    async def consolidate_funds(self, chain: str, destination_address: str, gas_price_gwei: float = None, 
-                                  max_gas_fee: float = 0.001) -> dict:
+        if chain not in self.wallets:
+            raise ValueError(f"Unsupported chain: {chain}")
+        return len(self.wallets[chain])
+        
+    def consolidate_funds(self, chain: str, destination_address: str, gas_price_gwei: float = None, 
+                         max_gas_fee: float = 0.001) -> dict:
         """
         Transfer funds from all wallets to a destination address, leaving enough for gas fees.
         
@@ -359,7 +364,7 @@ class WalletManager:
                     continue
                     
                 wallet_address = self.w3.to_checksum_address(wallet['address'])
-                balance_wei = await self._get_balance_with_retry(self.w3, wallet_address)
+                balance_wei = self._get_balance_with_retry(self.w3, wallet_address)
                 
                 if balance_wei <= 0:
                     continue
@@ -367,7 +372,7 @@ class WalletManager:
                 balance_eth = self.w3.from_wei(balance_wei, 'ether')
                 
                 # Calculate amount to send (leave enough for gas)
-                if balance_eth <= gas_cost_eth + max_gas_fee:
+                if float(balance_eth) <= float(gas_cost_eth) + max_gas_fee:
                     continue  # Skip if not enough to cover gas + max_gas_fee
                     
                 amount_to_send_wei = balance_wei - (gas_cost_wei + self.w3.to_wei(max_gas_fee, 'ether'))
@@ -417,7 +422,7 @@ class WalletManager:
         self.save_wallets()
         return result
 
-    async def transfer_funds(self, chain: str, from_address: str, private_key: str, to_address: str, amount: Decimal, gas_price_gwei: float = None) -> dict:
+    def transfer_funds(self, chain: str, from_address: str, private_key: str, to_address: str, amount: Decimal, gas_price_gwei: float = None) -> dict:
         """
         Transfer a specific amount of native currency from one address to another.
         
@@ -448,7 +453,7 @@ class WalletManager:
             gas_limit = 21000
             gas_cost_wei = gas_price_wei * gas_limit
             
-            balance_wei = await self._get_balance_with_retry(self.w3, from_address)
+            balance_wei = self._get_balance_with_retry(self.w3, from_address)
             amount_to_send_wei = self.w3.to_wei(amount, 'ether')
 
             if balance_wei < amount_to_send_wei + gas_cost_wei:
