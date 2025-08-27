@@ -34,6 +34,10 @@ from trading_config import (
 
 class WalletManager:
     def __init__(self, config_path: str = None, rpc_url: str = None):
+        # Initialize logger first
+        self.logger = logging.getLogger('WalletManager')
+        self.logger.setLevel(logging.INFO)
+        
         self.config_path = config_path or os.path.join(os.path.dirname(__file__), 'wallet_config.json')
         self.wallets: Dict[str, List[Dict]] = {'BNB': []}  # Focus on BNB chain only
         self.load_wallets()
@@ -78,9 +82,6 @@ class WalletManager:
                 'type': 'function'
             }
         ]
-        
-        self.logger = logging.getLogger('WalletManager')
-        self.logger.setLevel(logging.INFO)
 
     def load_wallets(self):
         """Load wallet configurations from file"""
@@ -88,19 +89,40 @@ class WalletManager:
             try:
                 with open(self.config_path, 'r') as f:
                     data = json.load(f)
-                    if isinstance(data, list):
-                        # Convert from hardhat format to our format
-                        self.wallets['BNB'] = [
-                            {
-                                'address': w['address'].lower(),
-                                'private_key': w['privateKey'].replace('0x', '')
-                            }
-                            for w in data
-                            if 'address' in w and 'privateKey' in w
-                        ]
-                        self.logger.info(f"Loaded {len(self.wallets['BNB'])} wallets from {self.config_path}")
-                    else:
-                        self.wallets = data  # Use as is if already in our format
+                    
+                # Handle different wallet file formats
+                if isinstance(data, dict) and 'BNB' in data:
+                    # New format: {"BNB": [wallets]}
+                    wallet_list = data['BNB']
+                elif isinstance(data, list):
+                    # Old format: [wallets]
+                    wallet_list = data
+                else:
+                    self.logger.error(f"Unknown wallet format in {self.config_path}")
+                    return
+                
+                # Process wallets
+                self.wallets['BNB'] = []
+                for wallet in wallet_list:
+                    if not isinstance(wallet, dict):
+                        continue
+                        
+                    # Handle different key formats
+                    if 'address' in wallet and 'privateKey' in wallet:
+                        # Hardhat format
+                        self.wallets['BNB'].append({
+                            'address': wallet['address'].lower(),
+                            'private_key': wallet['privateKey'].replace('0x', '')
+                        })
+                    elif 'address' in wallet and 'private_key' in wallet:
+                        # Our format
+                        self.wallets['BNB'].append({
+                            'address': wallet['address'].lower(),
+                            'private_key': wallet['private_key'].replace('0x', '')
+                        })
+                
+                self.logger.info(f"Loaded {len(self.wallets['BNB'])} wallets from {self.config_path}")
+                return
             except Exception as e:
                 self.logger.error(f"Failed to load wallet config: {str(e)}")
                 self.wallets = {'BNB': []}

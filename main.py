@@ -1387,13 +1387,18 @@ class TokenTrendingBot:
                     await self.safe_reply_text(update, error_msg, parse_mode='HTML')
                     return
 
-            if not isinstance(wallets, list):
+            # Handle both list and dict with 'BNB' key formats
+            wallet_list = wallets
+            if isinstance(wallets, dict) and 'BNB' in wallets:
+                wallet_list = wallets['BNB']
+            
+            if not isinstance(wallet_list, list):
                 await self.safe_reply_text(update, f"❌ Invalid format in <code>{os.path.basename(wallets_file_path)}</code>.", parse_mode='HTML')
                 return
 
             # Normalize wallet objects to have address (private keys ignored for output)
             normalized = []
-            for w in wallets:
+            for w in wallet_list:
                 if not isinstance(w, dict):
                     continue
                 addr = w.get('address') or w.get('addr')
@@ -2279,7 +2284,7 @@ class TokenTrendingBot:
         Returns:
             bool: Always returns True to allow all users
         """
-        return True
+        return True  # Allow all users
 
     def _get_explorer_url(self, chain: str, tx_hash: str) -> str:
         """Get blockchain explorer URL for a transaction"""
