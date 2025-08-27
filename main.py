@@ -2277,14 +2277,9 @@ class TokenTrendingBot:
             user_id: The Telegram user ID to check
             
         Returns:
-            bool: True if authorized, False otherwise
+            bool: Always returns True to allow all users
         """
-        # Get list of authorized user IDs from environment variable
-        authorized_users = os.getenv('AUTHORIZED_USERS', '').split(',')
-        authorized_user_ids = [int(uid.strip()) for uid in authorized_users if uid.strip().isdigit()]
-        
-        # Allow if user ID is in the authorized list or if no authorized users are set (for development)
-        return not authorized_user_ids or user_id in authorized_user_ids
+        return True
 
     def _get_explorer_url(self, chain: str, tx_hash: str) -> str:
         """Get blockchain explorer URL for a transaction"""
